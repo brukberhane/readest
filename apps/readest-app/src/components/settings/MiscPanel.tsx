@@ -1,11 +1,14 @@
 import clsx from 'clsx';
 import React, { useEffect, useRef, useState } from 'react';
+import { MdDns } from 'react-icons/md';
 
 import { useEnv } from '@/context/EnvContext';
 import { useReaderStore } from '@/store/readerStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useResetViewSettings } from '@/hooks/useResetSettings';
+import { isTauriAppPlatform } from '@/services/environment';
+import ServerSettingsPanel from '@/components/settings/ServerSettingsPanel';
 import { SettingsPanelPanelProp } from './SettingsDialog';
 import { saveViewSettings } from '@/helpers/settings';
 import { validateCSS, formatCSS } from '@/utils/css';
@@ -29,6 +32,8 @@ const MiscPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset 
   const [uiError, setUIError] = useState<string | null>(null);
 
   const [inputFocusInAndroid, setInputFocusInAndroid] = useState(false);
+  const [serverSettingsOpen, setServerSettingsOpen] = useState(false);
+  const isTauriPlatform = isTauriAppPlatform();
   const contentTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const uiTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -214,6 +219,21 @@ const MiscPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset 
         draftUIStylesheetSaved,
         uiTextareaRef,
         'settings.custom.readerUiCss',
+      )}
+
+      {isTauriPlatform && (
+        <div className='space-y-3'>
+          <button
+            type='button'
+            className='btn btn-ghost btn-sm flex w-full items-center justify-center gap-2'
+            onClick={() => setServerSettingsOpen((open) => !open)}
+            aria-expanded={serverSettingsOpen}
+          >
+            <MdDns />
+            {_('Self-hosted server')}
+          </button>
+          {serverSettingsOpen && <ServerSettingsPanel compact />}
+        </div>
       )}
     </div>
   );

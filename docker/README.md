@@ -42,7 +42,13 @@ update `docker/.env`:
 
 ### 2. Start the Stack (pull prebuilt client image)
 
-run from the `docker/` directory:
+run from the **repository root** (recommended):
+
+```bash
+docker compose up -d
+```
+
+or from the `docker/` directory (same stack via include):
 
 ```bash
 cd docker
