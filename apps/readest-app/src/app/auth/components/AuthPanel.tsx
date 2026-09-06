@@ -1,9 +1,12 @@
-import { useRef } from 'react';
+import { useRef, useState } from 'react';
 import Image from 'next/image';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { FcGoogle } from 'react-icons/fc';
 import { FaApple, FaGithub, FaDiscord } from 'react-icons/fa';
+import { MdDns } from 'react-icons/md';
 import { useTranslation } from '@/hooks/useTranslation';
+import { isTauriAppPlatform } from '@/services/environment';
+import ServerSettingsPanel from '@/components/settings/ServerSettingsPanel';
 import { ProviderLogin, type OAuthProvider } from './ProviderLogin';
 import EmailPasswordAuth from './EmailPasswordAuth';
 import ReadestCloudOptIn from './ReadestCloudOptIn';
@@ -22,6 +25,8 @@ export default function AuthPanel({
   onProviderSignIn,
 }: AuthPanelProps) {
   const _ = useTranslation();
+  const [serverSettingsOpen, setServerSettingsOpen] = useState(false);
+  const isTauriPlatform = isTauriAppPlatform();
   // `signInWithOAuth` redirects the whole page on web, which can cut off the
   // opt-in's settings write. Hold sign-in until it has landed. Null until the
   // user actually touches the checkbox, so the common path adds no delay.
@@ -68,6 +73,25 @@ export default function AuthPanel({
           label={_('Sign in with {{provider}}', { provider: 'Discord' })}
         />
       </div>
+      {isTauriPlatform && (
+        <>
+          <div className='flex w-full items-center gap-3' aria-hidden='true'>
+            <hr className='border-base-300 flex-1 border-t' />
+            <span className='text-base-content/50 text-xs'>{_('Self-hosted')}</span>
+            <hr className='border-base-300 flex-1 border-t' />
+          </div>
+          <button
+            type='button'
+            className='btn btn-ghost btn-sm flex w-full items-center justify-center gap-2'
+            onClick={() => setServerSettingsOpen((open) => !open)}
+            aria-expanded={serverSettingsOpen}
+          >
+            <MdDns />
+            {_('Self-hosted server')}
+          </button>
+          {serverSettingsOpen && <ServerSettingsPanel compact />}
+        </>
+      )}
       <div className='flex w-full items-center gap-3' aria-hidden='true'>
         <hr className='border-base-300 flex-1 border-t' />
         <span className='text-base-content/50 text-xs'>{_('or continue with email')}</span>

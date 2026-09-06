@@ -1,0 +1,362 @@
+# =============================================================================
+# Readest self-hosted backend (Docker Compose)
+# =============================================================================
+#
+# Quick start (from repo root):
+#
+#   cp docker/.env.example docker/.env
+#   # Edit docker/.env — at minimum set strong secrets and generate JWT keys.
+#   docker compose up -d
+#
+# Services started:
+#   client (readest)  :3000  — Next.js web UI + API (/api/sync, /api/storage/*, …)
+#   kong              :8000  — Supabase API gateway (/auth/v1, /rest/v1)
+#   auth (GoTrue)              — email + optional OAuth sign-in
+#   rest (PostgREST)           — Postgres REST API
+#   db (Postgres)              — database; schema + migrations on first boot
+#   minio             :9000  — S3-compatible object storage (book files, covers)
+#   minio-setup                — creates the S3 bucket once MinIO is healthy
+#
+# Database bootstrap (automatic on empty volume):
+#   docker/volumes/db/init/schema.sql          — base tables (books, book_configs, …)
+#   docker/volumes/db/migrations/*.sql         — incremental migrations (applied in order)
+#   docker/volumes/db/apply-migrations.sh      — records applied migrations in readest_meta
+#
+# After upgrades (existing volume), apply new migrations manually:
+#   docker compose exec db /docker-entrypoint-initdb.d/zz-readest-migrations.sh
+#
+# Custom domain / HTTPS: see docker/README.md and docker/nginx.conf.example
+#
+# -----------------------------------------------------------------------------
+# SELF_HOSTED=true — what it unlocks
+# -----------------------------------------------------------------------------
+# When SELF_HOSTED=true (default below), the client treats your instance as a
+# private deployment and unlocks every premium feature without Stripe/IAP:
+#   • Readest Cloud sync (books, progress, notes, stats, replicas)
+#   • Third-party cloud sync (WebDAV, Google Drive, S3, OneDrive, iCloud)
+#   • Offline TTS audio cache download
+#   • Send-to-Readest email inbox UI (inbound email worker not included)
+#   • Full customization / theme features
+# Storage and translation limits come from STORAGE_FIXED_QUOTA and
+# TRANSLATION_FIXED_QUOTA instead of subscription plans.
+# Set SELF_HOSTED=false only if you operate a multi-tenant hosted service with billing.
+#
+# -----------------------------------------------------------------------------
+# Configuration reference (all variables live in docker/.env)
+# -----------------------------------------------------------------------------
+#
+# --- Core URLs (required for production / custom domains) ---
+# HOST_IP                  Public hostname or IP browsers use (default: localhost)
+# SITE_URL                 Readest web app URL (default: http://localhost:3000)
+# API_EXTERNAL_URL         Public Kong/Supabase URL (default: http://localhost:8000)
+# SUPABASE_PUBLIC_URL      Browser-facing Supabase URL (defaults to HOST_IP:KONG_HTTP_PORT)
+# S3_PUBLIC_ENDPOINT       Browser-facing MinIO URL for presigned uploads (defaults to HOST_IP:9000)
+# ADDITIONAL_REDIRECT_URLS GoTrue redirect allow-list (comma-separated globs)
+#
+# --- Database ---
+# POSTGRES_PASSWORD        Strong password (32+ chars recommended)
+# POSTGRES_PORT            Internal Postgres port (default: 5432)
+# POSTGRES_DB              Database name (default: postgres)
+#
+# --- JWT / Supabase keys (required) ---
+# JWT_SECRET               Random secret (32+ chars); signs anon + service_role JWTs
+# JWT_EXPIRY               Access-token lifetime in seconds (default: 3600)
+# ANON_KEY                 HS256 JWT with payload {"role":"anon"} signed by JWT_SECRET
+# SERVICE_ROLE_KEY         HS256 JWT with payload {"role":"service_role"} signed by JWT_SECRET
+# KONG_HTTP_PORT           Host port mapped to Kong (default: 8000)
+#
+# --- Auth (GoTrue / email sign-in) ---
+# DISABLE_SIGNUP           Block new registrations (default: false)
+# ENABLE_EMAIL_SIGNUP      Allow email/password sign-up (default: true)
+# ENABLE_EMAIL_AUTOCONFIRM Auto-confirm new emails — no SMTP needed (default: true)
+# ENABLE_ANONYMOUS_USERS   Allow anonymous Supabase users (default: false)
+# SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS
+# SMTP_ADMIN_EMAIL / SMTP_SENDER_NAME   Required when ENABLE_EMAIL_AUTOCONFIRM=false
+#
+# --- OAuth sign-in (optional; configure in docker/.env, passed to auth service) ---
+# Enables Google/GitHub/Discord buttons on the login page (separate from Google Drive sync).
+# Register redirect URI with each provider: ${API_EXTERNAL_URL}/auth/v1/callback
+# GOOGLE_OAUTH_ENABLED, GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET
+# GITHUB_OAUTH_ENABLED, GITHUB_OAUTH_CLIENT_ID, GITHUB_OAUTH_CLIENT_SECRET
+# DISCORD_OAUTH_ENABLED, DISCORD_OAUTH_CLIENT_ID, DISCORD_OAUTH_CLIENT_SECRET
+#
+# --- Object storage (MinIO) ---
+# OBJECT_STORAGE_TYPE      s3 (default) — use MinIO in this stack
+# MINIO_ROOT_USER          MinIO access key (default: minioadmin)
+# MINIO_ROOT_PASSWORD      MinIO secret key
+# S3_BUCKET_NAME           Bucket for book files (default: readest-files)
+# S3_REGION                S3 region label (default: us-east-1)
+#
+# --- Self-hosted quotas (SELF_HOSTED=true) ---
+# STORAGE_FIXED_QUOTA      Per-user cloud storage bytes (default: 1073741824 = 1 GiB)
+# TRANSLATION_FIXED_QUOTA  Daily translation character budget (default: 50000)
+#
+# --- Fonts (custom domain) ---
+# FONT_BASE_URL            Mirror CJK webfonts when not on readest.com (see docker/README.md)
+#
+# --- AI assistant (optional server-side key) ---
+# AI_GATEWAY_API_KEY       Vercel AI Gateway key for /api/ai/chat and /api/ai/embed
+# AI_GATEWAY_EMBEDDING_MODEL  Embedding model id (default: openai/text-embedding-3-small)
+# Users may also supply their own gateway key in the app settings UI.
+#
+# --- Translation proxies (optional server-side keys) ---
+# DeepL (server proxy at /api/deepl/translate):
+#   DEEPL_FREE_API_KEYS    Comma-separated DeepL Free API keys
+#   DEEPL_PRO_API_KEYS     Comma-separated DeepL Pro API keys (used for pro-tier tokens)
+#   DEEPL_FREE_API         Override free API URL
+#   DEEPL_PRO_API          Override pro API URL
+#   DEEPL_X_FINGERPRINT    Optional DeepL fingerprint header
+# Azure + Yandex translators use built-in web proxies (/api/azure-translate,
+# /api/yandex-translate) — no extra keys; users must be signed in.
+# Google Translate in the client calls Google directly (no server key).
+#
+# --- Metadata search (optional) ---
+# GOOGLE_BOOKS_API_KEYS    Comma-separated Google Books API keys for /api/metadata/search
+#
+# --- Google Drive / OneDrive sync (third-party cloud; SELF_HOSTED unlocks UI) ---
+# These are NOT server env vars for the stock image — they are baked into the
+# client at image build time. The official image uses Readest's OAuth clients
+# (authorized for readest.com only). For your own domain, rebuild the client:
+#
+#   docker compose -f docker-compose.yml -f docker/compose.build.yaml up --build -d
+#
+# and set in docker/.env before building:
+#   NEXT_PUBLIC_GOOGLE_WEB_CLIENT_ID   Web OAuth client (GIS flow) for Google Drive sync
+#   NEXT_PUBLIC_GOOGLE_CLIENT_ID       Tauri/mobile Google OAuth client id
+#   NEXT_PUBLIC_MICROSOFT_CLIENT_ID    OneDrive / Microsoft Graph OAuth client id
+#
+# Register your SITE_URL origin on each OAuth client in Google Cloud / Azure portals.
+#
+# --- Billing (not used when SELF_HOSTED=true) ---
+# STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY_BASE64
+# APPLE_IAP_*, GOOGLE_IAP_* — mobile in-app purchase verification (hosted only)
+#
+# --- Image ---
+# READEST_IMAGE            Pre-built client image (default: ghcr.io/readest/readest:latest)
+#
+# Tauri/desktop/mobile apps: point at this server via Settings → Self-hosted server.
+# Public runtime config is served at:
+#   /.well-known/readest-client-config.json
+#   /api/public/runtime-config
+#   /runtime-config.js
+#
+# =============================================================================
+
+name: readest
+
+services:
+  db:
+    container_name: supabase-db
+    image: supabase/postgres:15.8.1.085
+    restart: unless-stopped
+    env_file:
+      - docker/.env
+    volumes:
+      - ./docker/volumes/db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql:Z
+      - ./docker/volumes/db/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql:Z
+      - ./docker/volumes/db/init/schema.sql:/docker-entrypoint-initdb.d/init-scripts/100-schema.sql:Z
+      - ./docker/volumes/db/migrations:/readest-migrations:Z
+      - ./docker/volumes/db/apply-migrations.sh:/docker-entrypoint-initdb.d/zz-readest-migrations.sh:Z
+      - db-data:/var/lib/postgresql/data:Z
+      - db-config:/etc/postgresql-custom
+    environment:
+      POSTGRES_HOST: /var/run/postgresql
+      PGPORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXP: ${JWT_EXPIRY:-3600}
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+      - -c
+      - log_min_messages=fatal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ${POSTGRES_DB:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  kong:
+    container_name: supabase-kong
+    image: kong:2.8.1
+    restart: unless-stopped
+    env_file:
+      - docker/.env
+    ports:
+      - "${KONG_HTTP_PORT:-8000}:8000/tcp"
+    volumes:
+      - ./docker/volumes/api/kong.yml:/home/kong/temp.yml:ro,z
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /home/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY}
+    entrypoint: bash -c 'eval "echo \"$$(cat ~/temp.yml)\"" > ~/kong.yml && /docker-entrypoint.sh kong docker-start'
+    depends_on:
+      auth:
+        condition: service_started
+      rest:
+        condition: service_started
+
+  auth:
+    container_name: supabase-auth
+    image: supabase/gotrue:v2.185.0
+    restart: unless-stopped
+    env_file:
+      - docker/.env
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: ${API_EXTERNAL_URL:-http://localhost:8000}
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@db:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-postgres}
+      GOTRUE_SITE_URL: ${SITE_URL:-http://localhost:3000}
+      GOTRUE_URI_ALLOW_LIST: ${ADDITIONAL_REDIRECT_URLS:-http://localhost:3000/**,http://localhost:8000/**}
+      GOTRUE_DISABLE_SIGNUP: ${DISABLE_SIGNUP:-false}
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: ${JWT_EXPIRY:-3600}
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: ${ENABLE_EMAIL_SIGNUP:-true}
+      GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED: ${ENABLE_ANONYMOUS_USERS:-false}
+      GOTRUE_MAILER_AUTOCONFIRM: ${ENABLE_EMAIL_AUTOCONFIRM:-true}
+      GOTRUE_SMTP_HOST: ${SMTP_HOST:-}
+      GOTRUE_SMTP_PORT: ${SMTP_PORT:-587}
+      GOTRUE_SMTP_USER: ${SMTP_USER:-}
+      GOTRUE_SMTP_PASS: ${SMTP_PASS:-}
+      GOTRUE_SMTP_ADMIN_EMAIL: ${SMTP_ADMIN_EMAIL:-admin@example.com}
+      GOTRUE_SMTP_SENDER_NAME: ${SMTP_SENDER_NAME:-Readest}
+      # Optional OAuth sign-in providers (see header docs)
+      GOTRUE_EXTERNAL_GOOGLE_ENABLED: ${GOOGLE_OAUTH_ENABLED:-false}
+      GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOTRUE_EXTERNAL_GOOGLE_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      GOTRUE_EXTERNAL_GOOGLE_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI:-${API_EXTERNAL_URL:-http://localhost:8000}/auth/v1/callback}
+      GOTRUE_EXTERNAL_GITHUB_ENABLED: ${GITHUB_OAUTH_ENABLED:-false}
+      GOTRUE_EXTERNAL_GITHUB_CLIENT_ID: ${GITHUB_OAUTH_CLIENT_ID:-}
+      GOTRUE_EXTERNAL_GITHUB_SECRET: ${GITHUB_OAUTH_CLIENT_SECRET:-}
+      GOTRUE_EXTERNAL_GITHUB_REDIRECT_URI: ${GITHUB_OAUTH_REDIRECT_URI:-${API_EXTERNAL_URL:-http://localhost:8000}/auth/v1/callback}
+      GOTRUE_EXTERNAL_DISCORD_ENABLED: ${DISCORD_OAUTH_ENABLED:-false}
+      GOTRUE_EXTERNAL_DISCORD_CLIENT_ID: ${DISCORD_OAUTH_CLIENT_ID:-}
+      GOTRUE_EXTERNAL_DISCORD_SECRET: ${DISCORD_OAUTH_CLIENT_SECRET:-}
+      GOTRUE_EXTERNAL_DISCORD_REDIRECT_URI: ${DISCORD_OAUTH_REDIRECT_URI:-${API_EXTERNAL_URL:-http://localhost:8000}/auth/v1/callback}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  rest:
+    container_name: supabase-rest
+    image: postgrest/postgrest:v14.3
+    restart: unless-stopped
+    env_file:
+      - docker/.env
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@db:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-postgres}
+      PGRST_DB_SCHEMAS: ${PGRST_DB_SCHEMAS:-public,graphql_public}
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_APP_SETTINGS_JWT_SECRET: ${JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_EXP: ${JWT_EXPIRY:-3600}
+    command: ["postgrest"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  minio:
+    container_name: readest-minio
+    image: minio/minio
+    restart: unless-stopped
+    env_file:
+      - docker/.env
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server --console-address ":9001" /data
+    volumes:
+      - minio-data:/data:z
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio-setup:
+    image: minio/mc
+    env_file:
+      - docker/.env
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set myminio http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD} &&
+      mc mb --ignore-existing myminio/${S3_BUCKET_NAME:-readest-files}
+      "
+
+  client:
+    container_name: readest-client
+    image: ${READEST_IMAGE:-ghcr.io/readest/readest:latest}
+    pull_policy: missing
+    restart: unless-stopped
+    env_file:
+      - docker/.env
+    ports:
+      - "${CLIENT_HTTP_PORT:-3000}:3000"
+    environment:
+      # --- Supabase (internal + browser-facing) ---
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://${HOST_IP:-localhost}:${KONG_HTTP_PORT:-8000}}
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_ADMIN_KEY: ${SERVICE_ROLE_KEY}
+      API_BASE_URL: ${SITE_URL:-http://localhost:3000}
+      # --- Self-hosted mode + quotas ---
+      SELF_HOSTED: ${SELF_HOSTED:-true}
+      STORAGE_FIXED_QUOTA: ${STORAGE_FIXED_QUOTA:-1073741824}
+      TRANSLATION_FIXED_QUOTA: ${TRANSLATION_FIXED_QUOTA:-50000}
+      FONT_BASE_URL: ${FONT_BASE_URL:-}
+      # --- Object storage (MinIO) ---
+      OBJECT_STORAGE_TYPE: ${OBJECT_STORAGE_TYPE:-s3}
+      S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://${HOST_IP:-localhost}:${MINIO_API_PORT:-9000}}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-readest-files}
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      # --- Sync API absolute URL generation ---
+      PROTOCOL: ${PROTOCOL:-http}
+      HOST: ${HOST:-localhost:3000}
+      # --- AI assistant ---
+      AI_GATEWAY_API_KEY: ${AI_GATEWAY_API_KEY:-}
+      AI_GATEWAY_EMBEDDING_MODEL: ${AI_GATEWAY_EMBEDDING_MODEL:-openai/text-embedding-3-small}
+      # --- Translation (DeepL server proxy) ---
+      DEEPL_FREE_API_KEYS: ${DEEPL_FREE_API_KEYS:-}
+      DEEPL_PRO_API_KEYS: ${DEEPL_PRO_API_KEYS:-}
+      DEEPL_FREE_API: ${DEEPL_FREE_API:-}
+      DEEPL_PRO_API: ${DEEPL_PRO_API:-}
+      DEEPL_X_FINGERPRINT: ${DEEPL_X_FINGERPRINT:-}
+      YANDEX_UPSTREAM_TIMEOUT_MS: ${YANDEX_UPSTREAM_TIMEOUT_MS:-}
+      # --- Metadata ---
+      GOOGLE_BOOKS_API_KEYS: ${GOOGLE_BOOKS_API_KEYS:-}
+      # --- Optional public temp storage bucket (share uploads) ---
+      TEMP_STORAGE_PUBLIC_BUCKET_NAME: ${TEMP_STORAGE_PUBLIC_BUCKET_NAME:-}
+    depends_on:
+      kong:
+        condition: service_started
+      minio-setup:
+        condition: service_completed_successfully
+
+volumes:
+  db-config:
+  db-data:
+  minio-data:

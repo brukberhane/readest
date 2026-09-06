@@ -25,6 +25,35 @@ export interface OAuthCallbackParams {
 
 // OAuth callbacks may carry data in the URL fragment (implicit flow tokens) or
 // the query string (provider/GoTrue errors), so we read from both.
+const APP_AUTH_STORAGE_KEYS = ['token', 'refresh_token', 'user', 'lastRedirectAt'] as const;
+const SUPABASE_AUTH_STORAGE_KEY_PATTERN = /^sb-.+-auth-token$/;
+
+export const clearStoredAuthSession = () => {
+  if (typeof window === 'undefined') return;
+
+  for (const key of APP_AUTH_STORAGE_KEYS) {
+    localStorage.removeItem(key);
+  }
+
+  for (const key of Object.keys(localStorage)) {
+    if (SUPABASE_AUTH_STORAGE_KEY_PATTERN.test(key)) {
+      localStorage.removeItem(key);
+    }
+  }
+};
+
+export const clearAuthSessionForServerChange = async () => {
+  const { resetSupabaseClientCache, supabase } = await import('@/utils/supabase');
+  try {
+    await supabase.auth.signOut();
+  } catch {
+    // Best-effort: local auth state still must be cleared when changing servers.
+  } finally {
+    clearStoredAuthSession();
+    resetSupabaseClientCache();
+  }
+};
+
 export function parseOAuthCallbackUrl(url: string): OAuthCallbackParams {
   const hashParams = new URLSearchParams(url.match(/#(.*)/)?.[1] ?? '');
   const queryParams = new URLSearchParams(url.match(/\?([^#]*)/)?.[1] ?? '');
