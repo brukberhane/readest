@@ -22,6 +22,9 @@ use tauri_plugin_fs::FsExt;
 
 #[cfg(desktop)]
 use tauri::{Listener, Url};
+#[cfg(target_os = "macos")]
+mod browser_cookies_macos;
+mod browser_fetch;
 mod clip_url;
 mod cover_thumbnail;
 mod dir_scanner;
@@ -357,6 +360,27 @@ type AppRuntime = tauri::Wry;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 #[cfg_attr(all(feature = "cef", target_os = "linux"), tauri::cef_entry_point)]
 pub fn run() {
+    // WebKitGTK's native-Wayland surface handling has a longstanding GTK/Mutter
+    // bug where a webview's first `configure` event can report a 0 height
+    // (`gdk_wayland_window_configure: assertion 'height > 0' failed`), and
+    // subsequent frames get cropped/rescaled until the compositor forces a
+    // relayout (e.g. on focus change). It reproduces on GNOME's Wayland
+    // session but not XWayland, and only affects the WebKitGTK (`wry`)
+    // runtime used by non-CEF Linux builds such as Flatpak; the CEF runtime
+    // that ships in our official deb/rpm/AppImage builds is unaffected (see
+    // #6096). This must run before GTK/webkit initialize (i.e. before
+    // `tauri::Builder::run`), so force XWayland here unless the user already
+    // picked a backend. This mirrors the same workaround already applied to
+    // the Nix dev shell in flake.nix.
+    #[cfg(all(target_os = "linux", not(feature = "cef")))]
+    if std::env::var_os("GDK_BACKEND").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        // SAFETY: this is the first thing `run()` does, before any other
+        // thread (tauri's async runtime, GTK, etc.) exists to race with it.
+        unsafe {
+            std::env::set_var("GDK_BACKEND", "x11");
+        }
+    }
+
     // Initialize Sentry as early as possible so panics during startup are
     // captured. `None` DSN (unset SENTRY_DSN) => disabled, so local and fork
     // builds don't report. This client covers Rust panics and the events the
@@ -495,6 +519,7 @@ pub fn run() {
             discord_rpc::clear_book_presence,
             clip_url::clip_url,
             web_browser::open_web_browser,
+            browser_fetch::fetch_web_browser_resource,
             web_browser::set_web_browser_status,
             localsend::commands::localsend_start,
             localsend::commands::localsend_stop,
@@ -672,8 +697,25 @@ pub fn run() {
             #[cfg(not(desktop))]
             let updater_disabled = false;
 
+            // One id per app run. The OS keeps re-delivering the URL the app was
+            // launched with — Android re-reads the sticky `activity.intent`
+            // every time it recreates the Activity, iOS reloads the document
+            // when WebKit recycles the WebContent process, and the deep-link
+            // plugin never clears its stored URL (#6104). The webview's
+            // consume-once marker therefore has to outlive the document but
+            // still expire on a real relaunch, so it keys off this.
+            let app_run_id = format!(
+                "{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
+
             let init_script = format!(
                 r#"
+                    window.__READEST_APP_RUN_ID__ = "{app_run_id}";
                     if ({is_eink}) window.__READEST_IS_EINK = true;
                     if ({cli_access}) window.__READEST_CLI_ACCESS = true;
                     if ({is_appimage}) window.__READEST_IS_APPIMAGE = true;
@@ -699,6 +741,7 @@ pub fn run() {
                         }}
                     }});
                 "#,
+                app_run_id = app_run_id,
                 is_eink = is_eink,
                 cli_access = cli_access,
                 is_appimage = is_appimage,
