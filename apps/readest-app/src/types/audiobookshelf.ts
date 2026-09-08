@@ -36,6 +36,8 @@ export interface ABSTrack {
   mimeType: string;
   /** The audio file's name, e.g. `20686-01.mp3`. */
   title?: string;
+  ino?: string;
+  size?: number; // bytes, when the expanded item populated them
 }
 
 export interface ABSChapter {

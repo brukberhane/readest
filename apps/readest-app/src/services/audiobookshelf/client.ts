@@ -7,6 +7,7 @@ import type {
   ABSMediaProgress,
   ABSPlaybackSession,
   ABSServer,
+  ABSTrack,
 } from '@/types/audiobookshelf';
 
 const PAGE_SIZE = 100;
@@ -352,12 +353,59 @@ export class ABSClient {
   async patchProgress(
     libraryItemId: string,
     payload: { currentTime: number; duration: number; progress: number },
+    episodeId?: string,
   ): Promise<void> {
-    await this.#request<void>(`/api/me/progress/${libraryItemId}`, {
+    const normalizedEpisodeId = episodeId || undefined;
+    const path = normalizedEpisodeId
+      ? `/api/me/progress/${libraryItemId}/${encodeURIComponent(normalizedEpisodeId)}`
+      : `/api/me/progress/${libraryItemId}`;
+    await this.#request<void>(path, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
+  }
+
+  async syncLocalSession(session: {
+    id: string;
+    libraryItemId: string;
+    episodeId?: string;
+    currentTime: number;
+    duration: number;
+    timeListening: number;
+    startedAt: number;
+    updatedAt: number;
+  }): Promise<void> {
+    const normalizedEpisodeId = session.episodeId || undefined;
+    await this.#request<void>('/api/session/local', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: session.id,
+        libraryItemId: session.libraryItemId,
+        ...(normalizedEpisodeId ? { episodeId: normalizedEpisodeId } : {}),
+        currentTime: session.currentTime,
+        duration: session.duration,
+        timeListening: session.timeListening,
+        startedAt: session.startedAt,
+        updatedAt: session.updatedAt,
+        mediaPlayer: 'html5',
+        playMethod: 0,
+        deviceInfo: { clientName: 'Readest', deviceId: getDeviceId() },
+      }),
+    });
+  }
+
+  downloadUrlForTrack(
+    itemId: string,
+    track: Pick<ABSTrack, 'contentUrl' | 'index'> & { ino?: string },
+  ): string {
+    if (track.contentUrl) {
+      const path = track.contentUrl.startsWith('/') ? track.contentUrl : `/${track.contentUrl}`;
+      return `${this.#base}${path}`;
+    }
+    const fileId = track.ino || String(track.index);
+    return `${this.#base}/api/items/${itemId}/file/${fileId}`;
   }
 
   /** Absolute, unauthenticated cover URL. */

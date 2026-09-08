@@ -8,11 +8,28 @@
 // Idempotent: reopening the same book hash while its session is still alive
 // reuses it instead of claiming a second one.
 
+import { convertFileSrc } from '@tauri-apps/api/core';
 import { AudiobookController, type AudiobookSource } from './AudiobookController';
 import { HtmlAudioClock } from './AudiobookClock';
 import { NativeAudiobookClock } from './NativeAudiobookClock';
+import { ABSAuthError } from '@/services/audiobookshelf/client';
 import { createAbsClient } from '@/services/audiobookshelf/createClient';
-import { AbsProgressSyncer, readLocalLastPlayedAt } from '@/services/audiobookshelf/progressSync';
+import {
+  mergeAbsSnapshot,
+  readShowCache,
+  readSnapshot,
+  snapshotFromExpanded,
+  writeShowCache,
+  writeSnapshot,
+  type AbsPlaybackSnapshot,
+  type AbsSnapshotTrack,
+} from '@/services/audiobookshelf/playbackSnapshot';
+import { readOutbox } from '@/services/audiobookshelf/progressOutbox';
+import {
+  AbsProgressSyncer,
+  readLocalLastPlayedAt,
+  readLocalPos,
+} from '@/services/audiobookshelf/progressSync';
 import { findABSServerById, useABSServerStore } from '@/store/absServerStore';
 import { ttsSessionManager } from '@/services/tts/TTSSessionManager';
 import type { TTSMediaBridgeMeta } from '@/services/tts/ttsMediaBridge';
@@ -25,6 +42,7 @@ import type { Book } from '@/types/book';
 import type {
   ABSChapter,
   ABSEpisode,
+  ABSLibraryItem,
   ABSMediaProgress,
   ABSServer,
   ABSTrack,
@@ -65,6 +83,89 @@ const resolveServer = (book: Book): { itemId: string; server: ABSServer } | null
     return null;
   }
   return { itemId: parsed.itemId, server };
+};
+
+const tracksFromSnapshot = (snapshot: AbsPlaybackSnapshot): ABSTrack[] =>
+  snapshot.tracks.map((track) => ({
+    index: track.index,
+    startOffset: track.startOffset,
+    duration: track.duration,
+    contentUrl: track.contentUrl,
+    mimeType: track.mimeType,
+    ino: track.fileId,
+    ...(track.size != null ? { size: track.size } : {}),
+  }));
+
+const snapshotForEpisode = (
+  item: ABSLibraryItem,
+  book: Book,
+  episode: ABSEpisode,
+): AbsPlaybackSnapshot => {
+  const tracks = episode.audioTrack ? [episode.audioTrack] : [];
+  return snapshotFromExpanded(
+    {
+      ...item,
+      media: {
+        ...item.media,
+        tracks,
+        chapters: episode.chapters ?? [],
+        duration: episode.duration ?? episode.audioTrack?.duration,
+      },
+    },
+    book.hash,
+    {
+      title: episode.title,
+      author: item.media.metadata.title || book.title,
+      episodeId: episode.id,
+    },
+  );
+};
+
+const refreshTrackCompleteness = async (
+  appService: AppService,
+  snapshot: AbsPlaybackSnapshot,
+): Promise<AbsPlaybackSnapshot> => {
+  const tracks: AbsSnapshotTrack[] = [];
+  for (const track of snapshot.tracks) {
+    let complete = false;
+    try {
+      if (await appService.exists(track.relPath, 'Books')) {
+        if (track.size != null && track.size > 0) {
+          const st = await appService.stats(track.relPath, 'Books');
+          complete = st.size === track.size;
+        } else {
+          complete = true;
+        }
+      }
+    } catch {
+      complete = false;
+    }
+    tracks.push({ ...track, complete });
+  }
+  return { ...snapshot, tracks, updatedAt: Date.now() };
+};
+
+const buildUrlByContent = async (
+  appService: AppService,
+  snapshot: AbsPlaybackSnapshot | null,
+): Promise<Map<string, string>> => {
+  const map = new Map<string, string>();
+  if (!snapshot || !isTauriAppPlatform()) return map;
+  for (const track of snapshot.tracks) {
+    if (!track.complete) continue;
+    try {
+      if (!(await appService.exists(track.relPath, 'Books'))) continue;
+      if (track.size != null && track.size > 0) {
+        const st = await appService.stats(track.relPath, 'Books');
+        if (st.size !== track.size) continue;
+      }
+      const absPath = await appService.resolveFilePath(track.relPath, 'Books');
+      map.set(track.contentUrl, isIOSTauri() ? absPath : convertFileSrc(absPath));
+    } catch {
+      // Missing or unreadable files fall through to HTTP.
+    }
+  }
+  return map;
 };
 
 /**
@@ -108,32 +209,85 @@ export const openAudiobookSession = async (input: {
 
   try {
     const client = createAbsClient(appService, server);
-    const item = await client.getItemExpanded(itemId);
+    const skipNetwork = typeof navigator !== 'undefined' && navigator.onLine === false;
 
     let tracks: ABSTrack[];
     let chapters: ABSChapter[];
     let title: string;
     let author: string;
     let duration: number;
+    let snapshot: AbsPlaybackSnapshot | null = null;
 
-    if (episodeId) {
-      const episode = item.media.episodes?.find((e) => e.id === episodeId);
-      if (!episode?.audioTrack) {
-        notifyEpisodeNotFound();
+    if (!skipNetwork) {
+      try {
+        const item = await client.getItemExpanded(itemId);
+        if (episodeId) {
+          const episode = item.media.episodes?.find((e) => e.id === episodeId);
+          if (!episode?.audioTrack) {
+            notifyEpisodeNotFound();
+            return null;
+          }
+          tracks = [episode.audioTrack];
+          chapters = episode.chapters ?? [];
+          title = episode.title;
+          author = item.media.metadata.title || book.title;
+          duration = episode.duration ?? episode.audioTrack.duration;
+          const existingSnap = await readSnapshot(appService, book.hash, episodeId);
+          snapshot = await refreshTrackCompleteness(
+            appService,
+            mergeAbsSnapshot(snapshotForEpisode(item, book, episode), existingSnap),
+          );
+        } else {
+          tracks = item.media.tracks ?? [];
+          chapters = item.media.chapters ?? [];
+          title = book.title;
+          author = book.author;
+          duration = item.media.duration ?? tracks.reduce((sum, track) => sum + track.duration, 0);
+          const existingSnap = await readSnapshot(appService, book.hash);
+          snapshot = await refreshTrackCompleteness(
+            appService,
+            mergeAbsSnapshot(
+              snapshotFromExpanded(item, book.hash, { title: book.title, author: book.author }),
+              existingSnap,
+            ),
+          );
+        }
+        await writeSnapshot(appService, snapshot);
+        if (item.mediaType === 'podcast' && item.media.episodes) {
+          await writeShowCache(appService, book.hash, {
+            version: 1,
+            itemId,
+            savedAt: Date.now(),
+            episodes: item.media.episodes,
+          });
+        }
+      } catch (error) {
+        if (error instanceof ABSAuthError) throw error;
+        snapshot = await readSnapshot(appService, book.hash, episodeId);
+        if (!snapshot) {
+          notifyConnectionError(server.name);
+          return null;
+        }
+        tracks = tracksFromSnapshot(snapshot);
+        chapters = snapshot.chapters;
+        title = snapshot.title;
+        author = snapshot.author;
+        duration = snapshot.duration;
+      }
+    } else {
+      snapshot = await readSnapshot(appService, book.hash, episodeId);
+      if (!snapshot) {
+        notifyConnectionError(server.name);
         return null;
       }
-      tracks = [episode.audioTrack];
-      chapters = episode.chapters ?? [];
-      title = episode.title;
-      author = item.media.metadata.title || book.title;
-      duration = episode.duration ?? episode.audioTrack.duration;
-    } else {
-      tracks = item.media.tracks ?? [];
-      chapters = item.media.chapters ?? [];
-      title = book.title;
-      author = book.author;
-      duration = item.media.duration ?? tracks.reduce((sum, track) => sum + track.duration, 0);
+      tracks = tracksFromSnapshot(snapshot);
+      chapters = snapshot.chapters;
+      title = snapshot.title;
+      author = snapshot.author;
+      duration = snapshot.duration;
     }
+
+    const urlByContent = await buildUrlByContent(appService, snapshot);
 
     const syncer = new AbsProgressSyncer({
       client,
@@ -143,19 +297,22 @@ export const openAudiobookSession = async (input: {
       duration,
       appService,
     });
-    // Book.progress is show-level, never per-episode, so an episode has no
-    // cached local position to compare against - only readLocalLastPlayedAt's
-    // real per-episode timestamp, written on every pause/tick/seek/end by
-    // AbsProgressSyncer#cacheLocally. Feeding that real timestamp in here
-    // (alongside a hardcoded 0 position) let a fresher local stamp - the app
-    // killed right after a pause, before the close-session call landed, or
-    // the server's clock running behind the device's - win
-    // resolveResumePosition and discard an at-worst-15s-stale server
-    // position, restarting the episode from 0. Passing 0 for both args
-    // instead makes the server always win for episodes.
     const startAt = episodeId
-      ? await syncer.begin(0, 0)
-      : await syncer.begin(book.progress?.[0] ?? 0, readLocalLastPlayedAt(book.hash));
+      ? skipNetwork
+        ? await syncer.begin(
+            readLocalPos(book.hash, episodeId),
+            readLocalLastPlayedAt(book.hash, episodeId),
+            { offline: true },
+          )
+        : await syncer.begin(
+            readLocalPos(book.hash, episodeId),
+            readLocalLastPlayedAt(book.hash, episodeId),
+          )
+      : skipNetwork
+        ? await syncer.begin(book.progress?.[0] ?? 0, readLocalLastPlayedAt(book.hash), {
+            offline: true,
+          })
+        : await syncer.begin(book.progress?.[0] ?? 0, readLocalLastPlayedAt(book.hash));
 
     const sourceObj: AudiobookSource = {
       itemId,
@@ -168,8 +325,9 @@ export const openAudiobookSession = async (input: {
       // captured copy - so a track load issued after a 401-triggered token
       // refresh (by this client or another, e.g. the periodic library sync)
       // carries the rotated token instead of the one this session started
-      // with.
+      // with. Local complete files are resolved from the precomputed map.
       resolveUrl: (contentPath: string) =>
+        urlByContent.get(contentPath) ??
         buildAbsMediaUrl(useABSServerStore.getState().getServer(server.id) ?? server, contentPath),
       startAt,
     };
@@ -234,10 +392,47 @@ export const loadAbsEpisodes = async (
       }
     }
 
+    await writeShowCache(appService, book.hash, {
+      version: 1,
+      itemId,
+      savedAt: Date.now(),
+      episodes: item.media.episodes ?? [],
+    });
+
     return { episodes, progressByEpisodeId };
   } catch (error) {
-    console.warn('[ABS] failed to load episodes:', error);
-    notifyConnectionError(server.name);
-    return null;
+    if (error instanceof ABSAuthError) {
+      console.warn('[ABS] failed to load episodes:', error);
+      notifyConnectionError(server.name);
+      return null;
+    }
+    try {
+      const cache = await readShowCache(appService, book.hash);
+      if (!cache) {
+        console.warn('[ABS] failed to load episodes:', error);
+        notifyConnectionError(server.name);
+        return null;
+      }
+      const episodes = [...cache.episodes].sort(
+        (a, b) => (b.publishedAt ?? 0) - (a.publishedAt ?? 0),
+      );
+      const progressByEpisodeId = new Map<string, ABSMediaProgress>();
+      for (const row of readOutbox()) {
+        if (row.itemId !== itemId || !row.episodeId) continue;
+        progressByEpisodeId.set(row.episodeId, {
+          libraryItemId: itemId,
+          episodeId: row.episodeId,
+          currentTime: row.currentTime,
+          duration: row.duration,
+          isFinished: row.duration > 0 && row.currentTime / row.duration >= 0.99,
+          lastUpdate: row.lastPlayedAt,
+        });
+      }
+      return { episodes, progressByEpisodeId };
+    } catch (cacheError) {
+      console.warn('[ABS] failed to load episodes:', cacheError);
+      notifyConnectionError(server.name);
+      return null;
+    }
   }
 };

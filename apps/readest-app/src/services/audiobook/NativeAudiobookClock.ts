@@ -90,6 +90,9 @@ export class NativeAudiobookClock implements AudiobookClock {
   // accept can still fail later (bad host, 404, decode failure) - that
   // surfaces exclusively through the async 'error' native event in
   // #onNativeEvent, once load() has already resolved.
+  // Native `load(path)` must remain a raw filesystem path for non-http
+  // sources (ABS offline files). Do not wrap iOS paths in convertFileSrc;
+  // the plugin uses URL(fileURLWithPath:).
   async load(url: string, startAt: number): Promise<void> {
     await this.#ensureReady();
     const positionMs = Math.max(0, startAt) * 1000;

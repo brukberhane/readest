@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef } from 'react';
 import { useEnv } from '@/context/EnvContext';
 import { useABSServerStore } from '@/store/absServerStore';
 import { backfillAbsCovers, syncAllAbsServers } from '@/services/audiobookshelf/librarySync';
+import { drainAbsProgressOutbox } from '@/services/audiobookshelf/progressOutbox';
 import { eventDispatcher } from '@/utils/event';
 
 const AUTO_CHECK_INTERVAL_MS = 5 * 60 * 1000;
@@ -34,6 +35,7 @@ export function useABSSync() {
 
     try {
       isSyncingRef.current = true;
+      await drainAbsProgressOutbox(appService);
       // Covers first, unauthenticated: books adopted via the cloud channel
       // must not stay coverless behind a failing (or absent) login.
       await backfillAbsCovers(appService);
@@ -65,6 +67,14 @@ export function useABSSync() {
     }, AUTO_CHECK_INTERVAL_MS);
     return () => clearInterval(intervalId);
   }, [appService, checkABSServers]);
+
+  useEffect(() => {
+    const onOnline = () => {
+      void checkABSServers();
+    };
+    window.addEventListener('online', onOnline);
+    return () => window.removeEventListener('online', onOnline);
+  }, [checkABSServers]);
 
   return { checkABSServers };
 }

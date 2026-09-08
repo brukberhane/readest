@@ -1,6 +1,6 @@
 import clsx from 'clsx';
 import { useEffect, useState } from 'react';
-import { MdCheckCircle, MdCheckCircleOutline } from 'react-icons/md';
+import { MdCheckCircle, MdCheckCircleOutline, MdOfflinePin } from 'react-icons/md';
 import {
   LiaCloudUploadAltSolid,
   LiaCloudDownloadAltSolid,
@@ -20,6 +20,7 @@ import { navigateToLogin } from '@/utils/nav';
 import { isReadestCloudStorageActive } from '@/services/sync/cloudSyncProvider';
 import { isFeedBook } from '@/services/rss/feedBookUrl';
 import { isAudiobook } from '@/utils/audiobook';
+import { useAbsMediaStore } from '@/store/absMediaStore';
 import { formatAuthors, formatDescription, formatSeries } from '@/utils/book';
 import { formatCompactTime } from '@/utils/time';
 import { INDETERMINATE_PROGRESS } from '@/utils/transfer';
@@ -86,6 +87,11 @@ const BookItem: React.FC<BookItemProps> = ({
   // total length when unplayed, remaining time once started (mirrors the
   // scrubber's "-remaining" convention).
   const isAbsBook = isAudiobook(book);
+  const absDownloaded = useAbsMediaStore((s) =>
+    isAbsBook
+      ? Object.values(s.presence).some((entry) => entry.bookHash === book.hash && entry.complete)
+      : false,
+  );
   const isPodcastShow = book.absMediaType === 'podcast';
   const absDuration = book.duration ?? 0;
   const absCurrentTime = book.progress?.[0] ?? 0;
@@ -242,6 +248,11 @@ const BookItem: React.FC<BookItemProps> = ({
                 aria-label={isAbsBook ? _('Audiobook') : _('Includes narration')}
               >
                 <LiaHeadphonesSolid size={iconSize15} />
+              </div>
+            )}
+            {isAbsBook && absDownloaded && (
+              <div className='pt-0.5 sm:pt-px' aria-label={_('Downloaded')}>
+                <MdOfflinePin size={iconSize15} />
               </div>
             )}
             {isTransferring

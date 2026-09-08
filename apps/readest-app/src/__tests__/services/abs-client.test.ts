@@ -270,6 +270,105 @@ describe('ABSClient', () => {
     expect(libraries).toEqual([{ id: 'l1', name: 'Audiobooks', mediaType: 'book' }]);
     expect(refreshCalls).toBe(1);
   });
+
+  it('syncLocalSession posts the UUID and float currentTime to /api/session/local', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, {}));
+    await client.syncLocalSession({
+      id: '11111111-1111-4111-8111-111111111111',
+      libraryItemId: 'item1',
+      currentTime: 12.5,
+      duration: 100,
+      timeListening: 8,
+      startedAt: 1000,
+      updatedAt: 2000,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://abs.local:13378/api/session/local',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string) as {
+      id: string;
+      currentTime: number;
+      mediaPlayer: string;
+      playMethod: number;
+    };
+    expect(body.id).toBe('11111111-1111-4111-8111-111111111111');
+    expect(body.currentTime).toBe(12.5);
+    expect(body.mediaPlayer).toBe('html5');
+    expect(body.playMethod).toBe(0);
+  });
+
+  it('patchProgress hits the book path when no episodeId is given', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, {}));
+    await client.patchProgress('item1', { currentTime: 12.5, duration: 100, progress: 0.125 });
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://abs.local:13378/api/me/progress/item1',
+      expect.objectContaining({ method: 'PATCH' }),
+    );
+    const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
+    expect(body).toEqual({ currentTime: 12.5, duration: 100, progress: 0.125 });
+  });
+
+  it('patchProgress hits the episode path when given', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, {}));
+    await client.patchProgress('item1', { currentTime: 1, duration: 10, progress: 0.1 }, 'ep1');
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://abs.local:13378/api/me/progress/item1/ep1',
+      expect.objectContaining({ method: 'PATCH' }),
+    );
+  });
+
+  it('patchProgress encodes a slash in the episode id', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, {}));
+    await client.patchProgress(
+      'item1',
+      { currentTime: 1, duration: 10, progress: 0.1 },
+      'ep/1 two',
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://abs.local:13378/api/me/progress/item1/ep%2F1%20two',
+      expect.objectContaining({ method: 'PATCH' }),
+    );
+  });
+
+  it('patchProgress treats an empty-string episodeId as the book path', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, {}));
+    await client.patchProgress('item1', { currentTime: 1, duration: 10, progress: 0.1 }, '');
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://abs.local:13378/api/me/progress/item1',
+      expect.objectContaining({ method: 'PATCH' }),
+    );
+  });
+
+  it('retries a 401 on patchProgress after refreshing the token', async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(401, {}))
+      .mockResolvedValueOnce(
+        jsonResponse(200, { user: { accessToken: 'at2', refreshToken: 'rt2' } }),
+      )
+      .mockResolvedValueOnce(jsonResponse(200, {}));
+    await client.patchProgress('item1', { currentTime: 1, duration: 10, progress: 0.1 });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('downloadUrlForTrack concatenates base + contentUrl without a double slash', () => {
+    expect(
+      client.downloadUrlForTrack('item1', {
+        index: 1,
+        contentUrl: '/api/items/item1/file/abc',
+      }),
+    ).toBe('http://abs.local:13378/api/items/item1/file/abc');
+  });
+
+  it('downloadUrlForTrack falls back to /file/<id> when contentUrl is empty', () => {
+    expect(
+      client.downloadUrlForTrack('item1', {
+        index: 1,
+        contentUrl: '',
+        ino: 'abc',
+      }),
+    ).toBe('http://abs.local:13378/api/items/item1/file/abc');
+  });
 });
 
 describe('ABSClient on the web platform', () => {

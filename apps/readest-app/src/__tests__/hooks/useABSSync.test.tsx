@@ -22,8 +22,12 @@ vi.mock('@/services/audiobookshelf/librarySync', () => ({
   syncAllAbsServers: vi.fn(),
   backfillAbsCovers: vi.fn(),
 }));
+vi.mock('@/services/audiobookshelf/progressOutbox', () => ({
+  drainAbsProgressOutbox: vi.fn().mockResolvedValue({ dialogRows: [] }),
+}));
 
 import { backfillAbsCovers, syncAllAbsServers } from '@/services/audiobookshelf/librarySync';
+import { drainAbsProgressOutbox } from '@/services/audiobookshelf/progressOutbox';
 import { useABSServerStore } from '@/store/absServerStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { eventDispatcher } from '@/utils/event';
@@ -31,6 +35,7 @@ import { useABSSync } from '@/hooks/useABSSync';
 
 const mockedSync = vi.mocked(syncAllAbsServers);
 const mockedBackfill = vi.mocked(backfillAbsCovers);
+const mockedDrain = vi.mocked(drainAbsProgressOutbox);
 
 // contentId/addedAt already set so loadABSServers' backfill is a no-op and
 // doesn't fire an unrelated saveSettings call.
@@ -57,6 +62,9 @@ const settle = async () => {
 
 beforeEach(() => {
   useABSServerStore.setState({ servers: [] });
+  mockedDrain.mockResolvedValue({ dialogRows: [] });
+  mockedBackfill.mockResolvedValue(undefined);
+  mockedSync.mockResolvedValue(undefined);
   useSettingsStore.setState({
     settings: makeSettings(),
     setSettings: (s: SystemSettings) => useSettingsStore.setState({ settings: s }),
@@ -83,9 +91,13 @@ describe('useABSSync', () => {
     expect(mockedSync).toHaveBeenCalledWith(appService);
   });
 
-  test('backfills covers before the authenticated sync so a failing login cannot block them', async () => {
+  test('drains the progress outbox before covers and the authenticated sync', async () => {
     useABSServerStore.setState({ servers: [server] });
     const order: string[] = [];
+    mockedDrain.mockImplementation(async () => {
+      order.push('drain');
+      return { dialogRows: [] };
+    });
     mockedBackfill.mockImplementation(async () => {
       order.push('backfill');
     });
@@ -96,8 +108,8 @@ describe('useABSSync', () => {
     renderHook(() => useABSSync());
     await settle();
 
-    expect(order).toEqual(['backfill', 'sync']);
-    expect(mockedBackfill).toHaveBeenCalledWith(appService);
+    expect(order).toEqual(['drain', 'backfill', 'sync']);
+    expect(mockedDrain).toHaveBeenCalledWith(appService);
   });
 
   test('does not sync when neither the store nor settings have servers', async () => {
@@ -160,6 +172,24 @@ describe('useABSSync', () => {
     });
 
     expect(mockedSync).toHaveBeenCalledTimes(1);
+  });
+
+  test('the window online event retriggers a check', async () => {
+    useABSServerStore.setState({ servers: [server] });
+    useSettingsStore.setState({ settings: makeSettings({ absServers: [server] }) });
+    mockedSync.mockResolvedValue();
+
+    renderHook(() => useABSSync());
+    await settle();
+    expect(mockedDrain).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      window.dispatchEvent(new Event('online'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(mockedDrain).toHaveBeenCalledTimes(2);
   });
 
   test('unmount clears the interval', async () => {

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppService, OsPlatform } from '@/types/system';
 import type { Book } from '@/types/book';
 import type { AudiobookSource } from '@/services/audiobook/AudiobookController';
+import type { AbsPlaybackSnapshot, AbsShowCache } from '@/services/audiobookshelf/playbackSnapshot';
 import type { ABSLibraryItem, ABSMediaProgress, ABSServer } from '@/types/audiobookshelf';
 import { makeAbsFilePath } from '@/utils/audiobook';
 
@@ -13,28 +14,51 @@ const mocks = vi.hoisted(() => ({
   getMe: vi.fn(async (): Promise<{ mediaProgress: ABSMediaProgress[] }> => ({ mediaProgress: [] })),
   syncerBegin: vi.fn(async () => 42),
   readLocalLastPlayedAt: vi.fn(() => 0),
+  readLocalPos: vi.fn(() => 0),
   syncerHooksResult: { onPause: vi.fn() },
   claim: vi.fn(),
   getSessionByHash: vi.fn(() => null as { bookKey: string; controller: unknown } | null),
   controllerCtor: vi.fn(),
   getOSPlatform: vi.fn((): OsPlatform => 'macos'),
   isTauriAppPlatform: vi.fn(() => false),
+  convertFileSrc: vi.fn((path: string) => `asset://localhost/${path}`),
+  exists: vi.fn(async (_path: string) => false),
+  stats: vi.fn(async () => ({
+    isFile: true,
+    isDirectory: false,
+    size: 0,
+    mtime: null,
+    atime: null,
+    birthtime: null,
+  })),
+  resolveFilePath: vi.fn(async (path: string) => `/fs/${path}`),
+  readSnapshot: vi.fn(async (): Promise<AbsPlaybackSnapshot | null> => null),
+  writeSnapshot: vi.fn(
+    async (_appService: AppService, _snapshot: AbsPlaybackSnapshot) => undefined,
+  ),
+  readShowCache: vi.fn(async (): Promise<AbsShowCache | null> => null),
+  writeShowCache: vi.fn(async (_appService: AppService, _cache: AbsShowCache) => undefined),
 }));
 
-vi.mock('@/services/audiobookshelf/client', () => ({
-  ABSClient: vi.fn().mockImplementation(function (
-    this: Record<string, unknown>,
-    server: ABSServer,
-  ) {
-    Object.assign(this, { server, getItemExpanded: mocks.getItemExpanded, getMe: mocks.getMe });
-  }),
-}));
+vi.mock('@/services/audiobookshelf/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/services/audiobookshelf/client')>();
+  return {
+    ...actual,
+    ABSClient: vi.fn().mockImplementation(function (
+      this: Record<string, unknown>,
+      server: ABSServer,
+    ) {
+      Object.assign(this, { server, getItemExpanded: mocks.getItemExpanded, getMe: mocks.getMe });
+    }),
+  };
+});
 
 vi.mock('@/services/audiobookshelf/progressSync', () => ({
   AbsProgressSyncer: vi.fn().mockImplementation(function (this: Record<string, unknown>) {
     Object.assign(this, { begin: mocks.syncerBegin, hooks: vi.fn(() => mocks.syncerHooksResult) });
   }),
   readLocalLastPlayedAt: mocks.readLocalLastPlayedAt,
+  readLocalPos: mocks.readLocalPos,
 }));
 
 vi.mock('@/services/tts/TTSSessionManager', () => ({
@@ -70,6 +94,23 @@ vi.mock('@/utils/misc', async (importOriginal) => {
 vi.mock('@/services/environment', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/services/environment')>();
   return { ...actual, isTauriAppPlatform: mocks.isTauriAppPlatform };
+});
+
+vi.mock('@tauri-apps/api/core', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@tauri-apps/api/core')>();
+  return { ...actual, convertFileSrc: mocks.convertFileSrc };
+});
+
+vi.mock('@/services/audiobookshelf/playbackSnapshot', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('@/services/audiobookshelf/playbackSnapshot')>();
+  return {
+    ...actual,
+    readSnapshot: mocks.readSnapshot,
+    writeSnapshot: mocks.writeSnapshot,
+    readShowCache: mocks.readShowCache,
+    writeShowCache: mocks.writeShowCache,
+  };
 });
 
 import { loadAbsEpisodes, openAudiobookSession } from '@/services/audiobook/openAudiobook';
@@ -119,7 +160,53 @@ const book: Book = {
   updatedAt: 0,
 };
 
-const appService = {} as AppService;
+const appService = {
+  exists: mocks.exists,
+  stats: mocks.stats,
+  resolveFilePath: mocks.resolveFilePath,
+} as unknown as AppService;
+
+const completeSnapshot = {
+  version: 1 as const,
+  bookHash: 'h1',
+  itemId: 'item1',
+  title: 'Pride and Prejudice',
+  author: 'Jane Austen',
+  duration: 36000,
+  chapters: [{ id: 0, start: 0, end: 100, title: 'Chapter One' }],
+  tracks: [
+    {
+      index: 1,
+      startOffset: 0,
+      duration: 18000,
+      contentUrl: '/api/items/item1/file/1',
+      mimeType: 'audio/mpeg',
+      fileId: '1',
+      relPath: 'h1/abs-media/track-1.mp3',
+      size: 100,
+      complete: true,
+    },
+  ],
+  updatedAt: 1,
+};
+
+const resetSnapshotMocks = () => {
+  mocks.exists.mockResolvedValue(false);
+  mocks.stats.mockResolvedValue({
+    isFile: true,
+    isDirectory: false,
+    size: 0,
+    mtime: null,
+    atime: null,
+    birthtime: null,
+  });
+  mocks.resolveFilePath.mockImplementation(async (path: string) => `/fs/${path}`);
+  mocks.convertFileSrc.mockImplementation((path: string) => `asset://localhost/${path}`);
+  mocks.readSnapshot.mockResolvedValue(null);
+  mocks.writeSnapshot.mockResolvedValue(undefined);
+  mocks.readShowCache.mockResolvedValue(null);
+  mocks.writeShowCache.mockResolvedValue(undefined);
+};
 
 describe('openAudiobookSession', () => {
   beforeEach(() => {
@@ -128,8 +215,11 @@ describe('openAudiobookSession', () => {
     mocks.getItemExpanded.mockResolvedValue(item);
     mocks.getMe.mockResolvedValue({ mediaProgress: [] });
     mocks.syncerBegin.mockResolvedValue(42);
+    mocks.readLocalPos.mockReturnValue(0);
+    mocks.readLocalLastPlayedAt.mockReturnValue(0);
     mocks.getOSPlatform.mockReturnValue('macos');
     mocks.isTauriAppPlatform.mockReturnValue(false);
+    resetSnapshotMocks();
     useABSServerStore.setState({ servers: [server] });
     useSettingsStore.setState({ settings: { absServers: [] } as unknown as SystemSettings });
   });
@@ -338,9 +428,11 @@ describe('openAudiobookSession - podcast episodes', () => {
     mocks.getItemExpanded.mockResolvedValue(podcastItem);
     mocks.getMe.mockResolvedValue({ mediaProgress: [] });
     mocks.syncerBegin.mockResolvedValue(42);
+    mocks.readLocalPos.mockReturnValue(0);
     mocks.readLocalLastPlayedAt.mockReturnValue(0);
     mocks.getOSPlatform.mockReturnValue('macos');
     mocks.isTauriAppPlatform.mockReturnValue(false);
+    resetSnapshotMocks();
     useABSServerStore.setState({ servers: [server] });
     useSettingsStore.setState({ settings: { absServers: [] } as unknown as SystemSettings });
   });
@@ -371,12 +463,8 @@ describe('openAudiobookSession - podcast episodes', () => {
     expect(result).not.toBeNull();
     expect(result!.bookKey.startsWith('p1-')).toBe(true);
     expect(mocks.getItemExpanded).toHaveBeenCalledWith('item1');
-    // No per-episode position cache exists, so there is no local stamp
-    // worth reading either - see the "always resumes... " test below for
-    // why readLocalLastPlayedAt must stay uncalled for an episode.
-    expect(mocks.readLocalLastPlayedAt).not.toHaveBeenCalled();
-    // Episode progress is 0 at open, never fed from the show-level
-    // Book.progress (which podcast shows never populate anyway).
+    expect(mocks.readLocalPos).toHaveBeenCalledWith('p1', 'ep1');
+    expect(mocks.readLocalLastPlayedAt).toHaveBeenCalledWith('p1', 'ep1');
     expect(mocks.syncerBegin).toHaveBeenCalledWith(0, 0);
 
     const [source] = mocks.controllerCtor.mock.calls[0]!;
@@ -392,18 +480,10 @@ describe('openAudiobookSession - podcast episodes', () => {
     expect(mocks.claim).toHaveBeenCalledTimes(1);
   });
 
-  it('always resumes an episode from the server position, even when a fresher local stamp exists', async () => {
-    // No per-episode position CACHE exists - only readLocalLastPlayedAt's
-    // "last played" timestamp, written by AbsProgressSyncer#cacheLocally on
-    // every pause/tick/seek/end. A fresher local stamp than the server's
-    // mediaProgress.lastUpdate can happen legitimately (app killed right
-    // after a pause, before the close-session call landed; or the server's
-    // clock running behind the device's) - resolveResumePosition must not
-    // be allowed to pick the hardcoded localCurrentTime=0 in that case, or
-    // the episode silently restarts from 0 instead of the server's real,
-    // at-worst-15s-stale position.
-    mocks.readLocalLastPlayedAt.mockReturnValue(Date.now());
-    mocks.syncerBegin.mockResolvedValue(900);
+  it('passes the cached episode position and last-played stamp into begin', async () => {
+    mocks.readLocalPos.mockReturnValue(33);
+    mocks.readLocalLastPlayedAt.mockReturnValue(4444);
+    mocks.syncerBegin.mockResolvedValue(33);
 
     const result = await openAudiobookSession({
       appService,
@@ -412,7 +492,9 @@ describe('openAudiobookSession - podcast episodes', () => {
     });
 
     expect(result).not.toBeNull();
-    expect(mocks.syncerBegin).toHaveBeenCalledWith(0, 0);
+    expect(mocks.readLocalPos).toHaveBeenCalledWith('p1', 'ep1');
+    expect(mocks.readLocalLastPlayedAt).toHaveBeenCalledWith('p1', 'ep1');
+    expect(mocks.syncerBegin).toHaveBeenCalledWith(33, 4444);
   });
 
   it('toasts "Episode not found" and returns null when the episode id does not match any episode', async () => {
@@ -492,6 +574,7 @@ describe('loadAbsEpisodes', () => {
     vi.clearAllMocks();
     mocks.getItemExpanded.mockResolvedValue(podcastItem);
     mocks.getMe.mockResolvedValue({ mediaProgress: [] });
+    resetSnapshotMocks();
     useABSServerStore.setState({ servers: [server] });
     useSettingsStore.setState({ settings: { absServers: [] } as unknown as SystemSettings });
   });
@@ -570,6 +653,223 @@ describe('loadAbsEpisodes', () => {
     expect(toastSpy).toHaveBeenCalledWith(
       'toast',
       expect.objectContaining({ type: 'error', message: 'Unable to connect to Home' }),
+    );
+  });
+
+  it('uses the show cache when the network fails', async () => {
+    mocks.getItemExpanded.mockRejectedValue(new Error('network down'));
+    mocks.readShowCache.mockResolvedValue({
+      version: 1,
+      itemId: 'item1',
+      savedAt: 1,
+      episodes: podcastItem.media.episodes ?? [],
+    });
+
+    const result = await loadAbsEpisodes(appService, podcastBook);
+
+    expect(result).not.toBeNull();
+    expect(result!.episodes.map((e) => e.id)).toEqual(['ep2', 'ep1', 'ep3']);
+  });
+});
+
+describe('openAudiobookSession offline snapshot', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.getSessionByHash.mockReturnValue(null);
+    mocks.getItemExpanded.mockResolvedValue(item);
+    mocks.getMe.mockResolvedValue({ mediaProgress: [] });
+    mocks.syncerBegin.mockResolvedValue(42);
+    mocks.readLocalPos.mockReturnValue(0);
+    mocks.readLocalLastPlayedAt.mockReturnValue(0);
+    mocks.getOSPlatform.mockReturnValue('macos');
+    mocks.isTauriAppPlatform.mockReturnValue(true);
+    resetSnapshotMocks();
+    useABSServerStore.setState({ servers: [server] });
+    useSettingsStore.setState({ settings: { absServers: [] } as unknown as SystemSettings });
+  });
+
+  afterEach(() => {
+    useABSServerStore.setState({ servers: [] });
+    useSettingsStore.setState({ settings: { absServers: [] } as unknown as SystemSettings });
+    vi.unstubAllGlobals();
+  });
+
+  it('claims from snapshot when getItemExpanded rejects and a complete local file exists', async () => {
+    mocks.getItemExpanded.mockRejectedValue(new Error('offline'));
+    mocks.readSnapshot.mockResolvedValue(completeSnapshot);
+    mocks.exists.mockResolvedValue(true);
+    mocks.stats.mockResolvedValue({
+      isFile: true,
+      isDirectory: false,
+      size: 100,
+      mtime: null,
+      atime: null,
+      birthtime: null,
+    });
+
+    const result = await openAudiobookSession({ appService, book });
+
+    expect(result).not.toBeNull();
+    expect(mocks.getItemExpanded).toHaveBeenCalled();
+    expect(mocks.claim).toHaveBeenCalledTimes(1);
+    const [source] = mocks.controllerCtor.mock.calls[0]!;
+    const resolveUrl = (source as AudiobookSource).resolveUrl;
+    expect(mocks.convertFileSrc).toHaveBeenCalled();
+    expect(resolveUrl('/api/items/item1/file/1')).toBe(
+      'asset://localhost//fs/h1/abs-media/track-1.mp3',
+    );
+  });
+
+  it('toasts and does not claim when getItemExpanded rejects and there is no snapshot', async () => {
+    mocks.getItemExpanded.mockRejectedValue(new Error('offline'));
+    const toastSpy = vi.spyOn(eventDispatcher, 'dispatch');
+
+    const result = await openAudiobookSession({ appService, book });
+
+    expect(result).toBeNull();
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(toastSpy).toHaveBeenCalledWith(
+      'toast',
+      expect.objectContaining({ type: 'error', message: 'Unable to connect to Home' }),
+    );
+  });
+
+  it('uses HTTP resolveUrl when the expanded item succeeds but no local file exists', async () => {
+    const result = await openAudiobookSession({ appService, book });
+    expect(result).not.toBeNull();
+    const [source] = mocks.controllerCtor.mock.calls[0]!;
+    const resolveUrl = (source as AudiobookSource).resolveUrl;
+    expect(resolveUrl('/api/items/item1/file/1')).toContain('token=token-1');
+    expect(mocks.convertFileSrc).not.toHaveBeenCalled();
+  });
+
+  it('mixes local url for a complete track with HTTP for a missing track', async () => {
+    mocks.getItemExpanded.mockResolvedValue({
+      ...item,
+      media: {
+        ...item.media,
+        tracks: [
+          item.media.tracks![0]!,
+          {
+            index: 2,
+            startOffset: 18000,
+            duration: 18000,
+            contentUrl: '/api/items/item1/file/2',
+            mimeType: 'audio/mpeg',
+            size: 50,
+          },
+        ],
+      },
+    });
+    mocks.readSnapshot.mockResolvedValue({
+      ...completeSnapshot,
+      tracks: [
+        completeSnapshot.tracks[0]!,
+        {
+          index: 2,
+          startOffset: 18000,
+          duration: 18000,
+          contentUrl: '/api/items/item1/file/2',
+          mimeType: 'audio/mpeg',
+          fileId: '2',
+          relPath: 'h1/abs-media/track-2.mp3',
+          size: 50,
+          complete: false,
+        },
+      ],
+    });
+    mocks.exists.mockImplementation(async (path: string) => String(path).includes('track-1'));
+    mocks.stats.mockResolvedValue({
+      isFile: true,
+      isDirectory: false,
+      size: 100,
+      mtime: null,
+      atime: null,
+      birthtime: null,
+    });
+
+    const result = await openAudiobookSession({ appService, book });
+    expect(result).not.toBeNull();
+    const [source] = mocks.controllerCtor.mock.calls[0]!;
+    const resolveUrl = (source as AudiobookSource).resolveUrl;
+    expect(resolveUrl('/api/items/item1/file/1')).toBe(
+      'asset://localhost//fs/h1/abs-media/track-1.mp3',
+    );
+    expect(resolveUrl('/api/items/item1/file/2')).toContain('token=token-1');
+  });
+
+  it('uses the raw filesystem path on iOS Tauri and does not call convertFileSrc', async () => {
+    mocks.getOSPlatform.mockReturnValue('ios');
+    mocks.getItemExpanded.mockRejectedValue(new Error('offline'));
+    mocks.readSnapshot.mockResolvedValue(completeSnapshot);
+    mocks.exists.mockResolvedValue(true);
+    mocks.stats.mockResolvedValue({
+      isFile: true,
+      isDirectory: false,
+      size: 100,
+      mtime: null,
+      atime: null,
+      birthtime: null,
+    });
+
+    const result = await openAudiobookSession({ appService, book });
+    expect(result).not.toBeNull();
+    expect(mocks.convertFileSrc).not.toHaveBeenCalled();
+    const [source] = mocks.controllerCtor.mock.calls[0]!;
+    expect((source as AudiobookSource).resolveUrl('/api/items/item1/file/1')).toBe(
+      '/fs/h1/abs-media/track-1.mp3',
+    );
+  });
+
+  it('does not play a local file whose size disagrees with the snapshot', async () => {
+    mocks.getItemExpanded.mockRejectedValue(new Error('offline'));
+    mocks.readSnapshot.mockResolvedValue(completeSnapshot);
+    mocks.exists.mockResolvedValue(true);
+    mocks.stats.mockResolvedValue({
+      isFile: true,
+      isDirectory: false,
+      size: 50,
+      mtime: null,
+      atime: null,
+      birthtime: null,
+    });
+
+    const result = await openAudiobookSession({ appService, book });
+    expect(result).not.toBeNull();
+    expect(mocks.convertFileSrc).not.toHaveBeenCalled();
+    const [source] = mocks.controllerCtor.mock.calls[0]!;
+    expect((source as AudiobookSource).resolveUrl('/api/items/item1/file/1')).toContain(
+      'token=token-1',
+    );
+  });
+
+  it('marks a previously complete track incomplete when expanded size changes', async () => {
+    mocks.getItemExpanded.mockResolvedValue({
+      ...item,
+      media: {
+        ...item.media,
+        tracks: [{ ...item.media.tracks![0]!, size: 200, ino: '1' }],
+      },
+    });
+    mocks.readSnapshot.mockResolvedValue(completeSnapshot);
+    mocks.exists.mockResolvedValue(true);
+    mocks.stats.mockResolvedValue({
+      isFile: true,
+      isDirectory: false,
+      size: 100,
+      mtime: null,
+      atime: null,
+      birthtime: null,
+    });
+
+    const result = await openAudiobookSession({ appService, book });
+    expect(result).not.toBeNull();
+    expect(mocks.writeSnapshot).toHaveBeenCalled();
+    const written = mocks.writeSnapshot.mock.calls[0]![1];
+    expect(written.tracks[0]!.complete).toBe(false);
+    const [source] = mocks.controllerCtor.mock.calls[0]!;
+    expect((source as AudiobookSource).resolveUrl('/api/items/item1/file/1')).toContain(
+      'token=token-1',
     );
   });
 });

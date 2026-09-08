@@ -1,9 +1,14 @@
 import clsx from 'clsx';
-import { MdCheckCircle, MdGraphicEq } from 'react-icons/md';
+import { MdCheckCircle, MdGraphicEq, MdFileDownload, MdOfflinePin } from 'react-icons/md';
 
 import type { ABSEpisode, ABSMediaProgress } from '@/types/audiobookshelf';
 import { useTranslation } from '@/hooks/useTranslation';
 import { formatPlaybackTime } from '@/utils/time';
+
+export type EpisodeDownloadStatus = {
+  complete: boolean;
+  inProgress: boolean;
+};
 
 interface EpisodesViewProps {
   episodes: ABSEpisode[];
@@ -13,6 +18,9 @@ interface EpisodesViewProps {
   /** The episode just tapped, whose claim hasn't landed yet. */
   pendingEpisodeId?: string;
   onSelectEpisode: (episode: ABSEpisode) => void;
+  onDownloadEpisode?: (episode: ABSEpisode) => void;
+  onRemoveEpisode?: (episode: ABSEpisode) => void;
+  downloadStatusById?: Map<string, EpisodeDownloadStatus>;
 }
 
 // A progress row counts as finished either by the server's own flag or by
@@ -31,6 +39,9 @@ const EpisodesView = ({
   activeEpisodeId,
   pendingEpisodeId,
   onSelectEpisode,
+  onDownloadEpisode,
+  onRemoveEpisode,
+  downloadStatusById,
 }: EpisodesViewProps) => {
   const _ = useTranslation();
 
@@ -56,11 +67,18 @@ const EpisodesView = ({
         const duration = episode.duration ?? episode.audioTrack?.duration ?? 0;
 
         return (
-          <button
+          <div
             key={episode.id}
-            type='button'
+            role='button'
+            tabIndex={0}
             aria-busy={isPending}
             onClick={() => onSelectEpisode(episode)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                onSelectEpisode(episode);
+              }
+            }}
             className={clsx(
               'flex w-full flex-col gap-0.5 rounded-lg px-2 py-2.5 text-start',
               (isActive || isPending) && 'eink-bordered not-eink:bg-base-200',
@@ -81,6 +99,32 @@ const EpisodesView = ({
                   className='loading loading-xs not-eink:loading-dots eink:loading-spinner shrink-0'
                 />
               )}
+              {onDownloadEpisode &&
+                (downloadStatusById?.get(episode.id)?.complete ? (
+                  <button
+                    type='button'
+                    aria-label={_('Remove Download')}
+                    className='btn btn-ghost btn-xs shrink-0'
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onRemoveEpisode?.(episode);
+                    }}
+                  >
+                    <MdOfflinePin />
+                  </button>
+                ) : (
+                  <button
+                    type='button'
+                    aria-label={_('Download')}
+                    className='btn btn-ghost btn-xs shrink-0'
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onDownloadEpisode(episode);
+                    }}
+                  >
+                    <MdFileDownload />
+                  </button>
+                ))}
             </div>
             <div className='text-base-content/60 flex w-full items-center gap-2 text-xs tabular-nums'>
               {episode.publishedAt != null && (
@@ -93,7 +137,7 @@ const EpisodesView = ({
                 percent !== null && <span>{percent}%</span>
               )}
             </div>
-          </button>
+          </div>
         );
       })}
     </div>

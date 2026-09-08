@@ -3,7 +3,10 @@ import {
   resolveResumePosition,
   AbsProgressSyncer,
   readLocalLastPlayedAt,
+  readLocalPos,
 } from '@/services/audiobookshelf/progressSync';
+import { dirtyRows, readOutbox } from '@/services/audiobookshelf/progressOutbox';
+import { ABSAuthError } from '@/services/audiobookshelf/client';
 import { useLibraryStore } from '@/store/libraryStore';
 import type { Book } from '@/types/book';
 
@@ -73,6 +76,8 @@ describe('AbsProgressSyncer', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
+    vi.stubGlobal('navigator', { onLine: true });
     syncer = new AbsProgressSyncer({
       client: client as never,
       itemId: 'i1',
@@ -449,6 +454,96 @@ describe('AbsProgressSyncer', () => {
       expect(readLocalLastPlayedAt('hShow')).toBe(111);
       expect(readLocalLastPlayedAt('hShow', 'ep1')).toBe(222);
       expect(readLocalLastPlayedAt('hShow', 'ep2')).toBe(333);
+    });
+  });
+
+  describe('offline begin and outbox', () => {
+    afterEach(() => {
+      localStorage.clear();
+      vi.unstubAllGlobals();
+    });
+
+    it('skips the network when navigator.onLine is false and returns the local float position', async () => {
+      vi.stubGlobal('navigator', { onLine: false });
+      const resume = await syncer.begin(700.25, 1000);
+      expect(resume).toBe(700.25);
+      expect(client.openPlaybackSession).not.toHaveBeenCalled();
+      expect(client.getMe).not.toHaveBeenCalled();
+    });
+
+    it('falls back to local position when openPlaybackSession fails with a network error', async () => {
+      vi.stubGlobal('navigator', { onLine: true });
+      client.openPlaybackSession.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+      const resume = await syncer.begin(700.25, 1000);
+      expect(client.openPlaybackSession).toHaveBeenCalled();
+      expect(resume).toBe(700.25);
+    });
+
+    it('rethrows ABSAuthError from begin', async () => {
+      vi.stubGlobal('navigator', { onLine: true });
+      client.openPlaybackSession.mockRejectedValueOnce(new ABSAuthError(401, '/play'));
+      await expect(syncer.begin(100, 0)).rejects.toBeInstanceOf(ABSAuthError);
+    });
+
+    it('onPause without a live session does not syncSession but dirties the outbox and writes local pos', async () => {
+      vi.stubGlobal('navigator', { onLine: false });
+      await syncer.begin(700.25, 1000);
+      syncer.hooks().onPause!(712.5);
+      expect(client.syncSession).not.toHaveBeenCalled();
+      expect(readLocalPos('h1')).toBe(712.5);
+      const rows = dirtyRows();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.currentTime).toBe(712.5);
+      expect(rows[0]!.itemId).toBe('i1');
+      expect(rows[0]!.localSessionId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+      );
+    });
+
+    it('keeps one outbox row and the same UUID across many ticks and pauses', async () => {
+      vi.stubGlobal('navigator', { onLine: false });
+      await syncer.begin(10, 0);
+      const hooks = syncer.hooks();
+      for (let i = 1; i <= 40; i++) hooks.onTick!(10 + i);
+      hooks.onPause!(51);
+      hooks.onPause!(52);
+      hooks.onPause!(53);
+      const rows = readOutbox();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.currentTime).toBe(53);
+      expect(rows[0]!.dirty).toBe(true);
+      const uuid = rows[0]!.localSessionId;
+      expect(uuid.length).toBeGreaterThan(0);
+      expect(dirtyRows()).toHaveLength(1);
+    });
+
+    it('onTick still calls syncSession when a live session exists, and dirties the outbox if sync rejects', async () => {
+      vi.stubGlobal('navigator', { onLine: true });
+      await syncer.begin(0, 0);
+      const hooks = syncer.hooks();
+      hooks.onTick!(515);
+      await vi.waitFor(() => expect(client.syncSession).toHaveBeenCalled());
+      client.syncSession.mockRejectedValueOnce(new Error('offline'));
+      expect(() => hooks.onTick!(530)).not.toThrow();
+      await vi.waitFor(() => expect(dirtyRows()).toHaveLength(1));
+      expect(dirtyRows()[0]!.currentTime).toBe(530);
+    });
+
+    it('episode syncer writes abs-local-pos and an outbox row with episodeId', async () => {
+      vi.stubGlobal('navigator', { onLine: false });
+      const episodeSyncer = new AbsProgressSyncer({
+        client: client as never,
+        itemId: 'show1',
+        episodeId: 'ep1',
+        bookHash: 'h1',
+        duration: 1800,
+        appService: { saveLibraryBooks: vi.fn() } as never,
+      });
+      await episodeSyncer.begin(33.3, 0);
+      episodeSyncer.hooks().onPause!(40.1);
+      expect(readLocalPos('h1', 'ep1')).toBe(40.1);
+      expect(localStorage.getItem('abs-local-pos-h1:ep1')).toBe('40.1');
+      expect(dirtyRows()[0]!.episodeId).toBe('ep1');
     });
   });
 });

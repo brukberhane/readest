@@ -5,10 +5,17 @@
 // server round-trip lands.
 
 import type { ABSClient } from '@/services/audiobookshelf/client';
+import { ABSAuthError } from '@/services/audiobookshelf/client';
 import type { AudiobookProgressHooks } from '@/services/audiobook/AudiobookController';
 import type { AppService } from '@/types/system';
 import type { Book } from '@/types/book';
 import { useLibraryStore } from '@/store/libraryStore';
+import {
+  findOutboxRow,
+  upsertOutbox,
+  writeLocalPos,
+  type AbsProgressOutboxRow,
+} from '@/services/audiobookshelf/progressOutbox';
 
 // Mirrors TTSSessionManager's PERSIST_THROTTLE_MS pattern: the in-memory
 // library store is updated on every hook so the UI stays current, but the
@@ -55,6 +62,8 @@ export const readLocalLastPlayedAt = (bookHash: string, episodeId?: string): num
     return 0;
   }
 };
+
+export { readLocalPos, writeLocalPos } from '@/services/audiobookshelf/progressOutbox';
 
 /**
  * The single newest-wins comparison for ABS progress: local wins only when
@@ -107,32 +116,62 @@ export class AbsProgressSyncer {
     this.#appService = input.appService;
   }
 
-  /** Open the server listening session; returns the resume position honoring resolveResumePosition. */
-  async begin(localCurrentTime: number, localLastPlayedAt: number): Promise<number> {
-    const [session, me] = await Promise.all([
-      this.#client.openPlaybackSession(this.#itemId, this.#episodeId),
-      this.#client.getMe(),
-    ]);
-    this.#sessionId = session.id;
-    // Match on (libraryItemId, episodeId) together, normalizing both sides
-    // through normalizeEpisodeId: a book (no episodeId) refuses to match a
-    // show-level or other-episode entry, and an episode refuses to match
-    // its show's book-level entry. An explicit `episodeId: null` on the
-    // mediaProgress entry (the book case, per /api/me) normalizes to
-    // `undefined` the same as an absent field.
-    const serverLastUpdate =
-      me.mediaProgress.find(
+  /**
+   * Open the server listening session; returns the resume position honoring
+   * resolveResumePosition. When the device is offline, skips the network and
+   * returns the local float position instead.
+   */
+  async begin(
+    localCurrentTime: number,
+    localLastPlayedAt: number,
+    opts?: { offline?: boolean },
+  ): Promise<number> {
+    const skipNetwork =
+      (typeof navigator !== 'undefined' && navigator.onLine === false) ||
+      (opts?.offline === true && typeof navigator !== 'undefined' && navigator.onLine === false);
+    if (skipNetwork) {
+      this.#sessionId = null;
+      this.#lastSyncedPosition = localCurrentTime;
+      return localCurrentTime;
+    }
+
+    try {
+      const [session, me] = await Promise.all([
+        this.#client.openPlaybackSession(this.#itemId, this.#episodeId),
+        this.#client.getMe(),
+      ]);
+      this.#sessionId = session.id;
+      // Match on (libraryItemId, episodeId) together, normalizing both sides
+      // through normalizeEpisodeId: a book (no episodeId) refuses to match a
+      // show-level or other-episode entry, and an episode refuses to match
+      // its show's book-level entry. An explicit `episodeId: null` on the
+      // mediaProgress entry (the book case, per /api/me) normalizes to
+      // `undefined` the same as an absent field.
+      const progress = me.mediaProgress.find(
         (p) =>
           p.libraryItemId === this.#itemId && normalizeEpisodeId(p.episodeId) === this.#episodeId,
-      )?.lastUpdate ?? 0;
-    const resume = resolveResumePosition({
-      serverCurrentTime: session.currentTime,
-      serverLastUpdate,
-      localCurrentTime,
-      localLastPlayedAt,
-    });
-    this.#lastSyncedPosition = resume;
-    return resume;
+      );
+      const serverLastUpdate = progress?.lastUpdate ?? 0;
+      const resume = resolveResumePosition({
+        serverCurrentTime: session.currentTime,
+        serverLastUpdate,
+        localCurrentTime,
+        localLastPlayedAt,
+      });
+      this.#lastSyncedPosition = resume;
+      this.#seedFromServer({
+        serverCurrentTime: session.currentTime,
+        serverLastUpdate,
+        localCurrentTime,
+        localLastPlayedAt,
+      });
+      return resume;
+    } catch (err) {
+      if (err instanceof ABSAuthError) throw err;
+      this.#sessionId = null;
+      this.#lastSyncedPosition = localCurrentTime;
+      return localCurrentTime;
+    }
   }
 
   /** Wire into AudiobookController: returns hooks that sync + cache locally. */
@@ -174,15 +213,93 @@ export class AbsProgressSyncer {
     if (this.#sessionId) {
       this.#client
         .closeSession(this.#sessionId, { currentTime: pos, timeListened, duration: this.#duration })
+        .then(() => this.#persistCleanRow(pos))
         .catch(console.warn);
+    } else {
+      this.#enqueueDirty(pos, timeListened);
     }
   }
 
   #syncSession(pos: number, timeListened: number): void {
-    if (!this.#sessionId) return;
+    if (!this.#sessionId) {
+      this.#enqueueDirty(pos, timeListened);
+      return;
+    }
     this.#client
       .syncSession(this.#sessionId, { currentTime: pos, timeListened, duration: this.#duration })
-      .catch(console.warn);
+      .then(() => this.#persistCleanRow(pos))
+      .catch((err: unknown) => {
+        console.warn(err);
+        this.#enqueueDirty(pos, timeListened);
+      });
+  }
+
+  #seedFromServer(input: {
+    serverCurrentTime: number;
+    serverLastUpdate: number;
+    localCurrentTime: number;
+    localLastPlayedAt: number;
+  }): void {
+    const localWins = isLocalProgressFresher(input.localLastPlayedAt, input.serverLastUpdate);
+    if (!localWins) {
+      writeLocalPos(this.#bookHash, input.serverCurrentTime, this.#episodeId);
+    }
+    const existing = findOutboxRow(this.#itemId, this.#episodeId);
+    const currentTime = localWins
+      ? (existing?.currentTime ?? input.localCurrentTime)
+      : input.serverCurrentTime;
+    upsertOutbox(
+      this.#rowFromExisting(existing, currentTime, {
+        serverLastUpdateCached: input.serverLastUpdate,
+      }),
+    );
+  }
+
+  #persistCleanRow(pos: number): void {
+    const existing = findOutboxRow(this.#itemId, this.#episodeId);
+    upsertOutbox({
+      ...this.#rowFromExisting(existing, pos, {
+        dirty: false,
+        localSessionId: '',
+        timeListening: 0,
+      }),
+    });
+  }
+
+  #enqueueDirty(pos: number, timeListened: number): void {
+    const existing = findOutboxRow(this.#itemId, this.#episodeId);
+    const reuseId = existing?.dirty && existing.localSessionId ? existing.localSessionId : '';
+    const localSessionId = reuseId || crypto.randomUUID();
+    const timeListening = (existing?.dirty ? existing.timeListening : 0) + timeListened;
+    upsertOutbox(
+      this.#rowFromExisting(existing, pos, {
+        dirty: true,
+        localSessionId,
+        timeListening,
+        lastPlayedAt: Date.now(),
+      }),
+    );
+  }
+
+  #rowFromExisting(
+    existing: AbsProgressOutboxRow | undefined,
+    currentTime: number,
+    overrides: Partial<AbsProgressOutboxRow>,
+  ): AbsProgressOutboxRow {
+    const row: AbsProgressOutboxRow = {
+      bookHash: this.#bookHash,
+      itemId: this.#itemId,
+      localSessionId: existing?.localSessionId ?? '',
+      currentTime,
+      duration: this.#duration,
+      timeListening: existing?.timeListening ?? 0,
+      lastPlayedAt: existing?.lastPlayedAt ?? Date.now(),
+      dirty: existing?.dirty ?? false,
+      serverLastUpdateCached: existing?.serverLastUpdateCached,
+      ...overrides,
+    };
+    if (this.#episodeId) row.episodeId = this.#episodeId;
+    return row;
   }
 
   // Updates the library book's cached progress and, throttled, persists the
@@ -193,6 +310,8 @@ export class AbsProgressSyncer {
   // regress the resume position (pause, end) rather than just being a stale
   // intermediate tick.
   #cacheLocally(pos: number, force: boolean): void {
+    writeLocalPos(this.#bookHash, pos, this.#episodeId);
+
     const { library, setLibrary } = useLibraryStore.getState();
     const idx = library.findIndex((b) => b.hash === this.#bookHash);
     if (idx !== -1) {

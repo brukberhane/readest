@@ -26,9 +26,14 @@ vi.mock('@/context/EnvContext', () => ({
   useEnv: () => ({ envConfig, appService: null }),
 }));
 
-vi.mock('@/store/settingsStore', () => ({
-  useSettingsStore: () => ({ settings: { globalViewSettings: { isEink: false } } }),
-}));
+vi.mock('@/store/settingsStore', () => {
+  const hook = Object.assign(() => ({ settings: { globalViewSettings: { isEink: false } } }), {
+    getState: () => ({
+      settings: { globalViewSettings: { isEink: false }, absServers: [] },
+    }),
+  });
+  return { useSettingsStore: hook };
+});
 
 vi.mock('@/app/reader/components/tts/TTSScrubber', () => ({
   default: () => <div data-testid='scrubber' />,
@@ -38,6 +43,14 @@ const mocks = vi.hoisted(() => ({
   getSessionByHash: vi.fn(() => null as { bookKey: string; controller: unknown } | null),
   sessionListeners: new Set<() => void>(),
   loadAbsEpisodes: vi.fn(),
+  isTauri: vi.fn(() => false),
+  queueBook: vi.fn(),
+  queueEpisode: vi.fn(),
+  cancelDownload: vi.fn(),
+  removeDownload: vi.fn(),
+  drain: vi.fn(async () => ({ dialogRows: [] as unknown[] })),
+  keepServer: vi.fn(),
+  keepDevice: vi.fn(),
 }));
 
 vi.mock('@/services/tts/TTSSessionManager', () => ({
@@ -61,7 +74,30 @@ vi.mock('@/services/audiobook/openAudiobook', () => ({
   loadAbsEpisodes: mocks.loadAbsEpisodes,
 }));
 
+vi.mock('@/services/environment', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/services/environment')>();
+  return { ...actual, isTauriAppPlatform: mocks.isTauri };
+});
+
+vi.mock('@/services/audiobookshelf/absMediaDownload', () => ({
+  absMediaDownloadManager: {
+    queueBook: mocks.queueBook,
+    queueEpisode: mocks.queueEpisode,
+    cancel: mocks.cancelDownload,
+    removeDownload: mocks.removeDownload,
+  },
+}));
+
+vi.mock('@/services/audiobookshelf/progressOutbox', () => ({
+  drainAbsProgressOutbox: mocks.drain,
+  keepServerProgress: mocks.keepServer,
+  keepDeviceProgress: mocks.keepDevice,
+  setAbsOnScreenItem: vi.fn(),
+}));
+
 import PlayerView from '@/app/player/components/PlayerView';
+import EpisodesView from '@/app/player/components/EpisodesView';
+import { useAbsMediaStore } from '@/store/absMediaStore';
 
 const book: Book = {
   hash: 'h1',
@@ -294,7 +330,7 @@ describe('PlayerView embedded Episodes subview', () => {
     // so the scrubber is still in the DOM.
     expect(screen.getByText('Episode Two')).toBeTruthy();
     expect(screen.queryByTestId('scrubber')).toBeTruthy();
-    const pendingRow = screen.getByText('Episode Two').closest('button');
+    const pendingRow = screen.getByText('Episode Two').closest('[role="button"]');
     expect(pendingRow?.getAttribute('aria-busy')).toBe('true');
 
     // The claim lands: the parent hands down a controller for episode two,
@@ -385,9 +421,9 @@ describe('PlayerView embedded Episodes subview', () => {
         pendingEpisodeId='ep2'
       />,
     );
-    expect(screen.getByText('Episode Two').closest('button')?.getAttribute('aria-busy')).toBe(
-      'true',
-    );
+    expect(
+      screen.getByText('Episode Two').closest('[role="button"]')?.getAttribute('aria-busy'),
+    ).toBe('true');
 
     // The claim failed (page.tsx clears pendingEpisodeId directly on a null
     // result or a throw, WITHOUT ever handing down a new controller).
@@ -402,9 +438,9 @@ describe('PlayerView embedded Episodes subview', () => {
       />,
     );
 
-    expect(screen.getByText('Episode Two').closest('button')?.getAttribute('aria-busy')).toBe(
-      'false',
-    );
+    expect(
+      screen.getByText('Episode Two').closest('[role="button"]')?.getAttribute('aria-busy'),
+    ).toBe('false');
     // Still on the Episodes subview (sheet stays open) - a failed claim must
     // not switch views. The transport underneath stays mounted regardless.
     expect(screen.getByText('Episode Two')).toBeTruthy();
@@ -556,5 +592,184 @@ describe('PlayerView picker sheets', () => {
     expect(screen.getByTestId('scrubber')).toBeTruthy();
 
     await waitFor(() => expect(screen.getByText('Episode One')).toBeTruthy());
+  });
+});
+
+const audiobookBook: Book = {
+  hash: 'h1',
+  format: 'ABS',
+  filePath: 'abs://srv1/item1',
+  title: 'Pride',
+  author: 'Jane',
+  createdAt: 0,
+  updatedAt: 0,
+};
+
+describe('PlayerView offline download control', () => {
+  beforeEach(() => {
+    mocks.getSessionByHash.mockReturnValue(null);
+    mocks.sessionListeners.clear();
+    mocks.isTauri.mockReturnValue(true);
+    mocks.drain.mockResolvedValue({ dialogRows: [] });
+    mocks.keepServer.mockClear();
+    mocks.keepDevice.mockClear();
+    mocks.queueBook.mockClear();
+    envConfig.getAppService.mockResolvedValue({});
+    useAbsMediaStore.setState({ items: {}, presence: {} });
+  });
+
+  afterEach(() => {
+    cleanup();
+    mocks.isTauri.mockReturnValue(false);
+    useAbsMediaStore.setState({ items: {}, presence: {} });
+  });
+
+  it('shows Download, confirms, and queues the book', async () => {
+    render(
+      <PlayerView
+        book={audiobookBook}
+        bookKey='h1-book'
+        controller={asController(new FakeController())}
+        onGoBack={vi.fn()}
+        onSelectEpisode={vi.fn()}
+        pendingEpisodeId={null}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Download' }));
+    expect(
+      screen.getAllByText('Download this audiobook for offline playback?').length,
+    ).toBeGreaterThan(0);
+    const downloadButtons = screen.getAllByRole('button', { name: 'Download' });
+    fireEvent.click(downloadButtons[downloadButtons.length - 1]!);
+    await waitFor(() => expect(mocks.queueBook).toHaveBeenCalled());
+  });
+
+  it('hides Download on web', () => {
+    mocks.isTauri.mockReturnValue(false);
+    render(
+      <PlayerView
+        book={audiobookBook}
+        bookKey='h1-book'
+        controller={asController(new FakeController())}
+        onGoBack={vi.fn()}
+        onSelectEpisode={vi.fn()}
+        pendingEpisodeId={null}
+      />,
+    );
+    expect(screen.queryByLabelText('Download')).toBeNull();
+  });
+
+  it('keep-server seeks to the server position without syncLocalSession', async () => {
+    mocks.drain.mockResolvedValue({
+      dialogRows: [
+        {
+          local: {
+            bookHash: 'h1',
+            itemId: 'item1',
+            localSessionId: 'uuid',
+            currentTime: 10,
+            duration: 100,
+            timeListening: 1,
+            lastPlayedAt: 1,
+            dirty: true,
+          },
+          server: { currentTime: 80, lastUpdate: 9, duration: 100 },
+        },
+      ],
+    });
+    const controller = new FakeController();
+    const seekSpy = vi.spyOn(controller, 'seekToTime');
+    render(
+      <PlayerView
+        book={audiobookBook}
+        bookKey='h1-book'
+        controller={asController(controller)}
+        onGoBack={vi.fn()}
+        onSelectEpisode={vi.fn()}
+        pendingEpisodeId={null}
+      />,
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByText('This device and the server have different playback positions.'),
+      ).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Keep server' }));
+    await waitFor(() => expect(mocks.keepServer).toHaveBeenCalled());
+    expect(seekSpy).toHaveBeenCalledWith(80);
+    expect(mocks.keepDevice).not.toHaveBeenCalled();
+  });
+
+  it('keep-this-device flushes local progress', async () => {
+    mocks.drain.mockResolvedValue({
+      dialogRows: [
+        {
+          local: {
+            bookHash: 'h1',
+            itemId: 'item1',
+            localSessionId: 'uuid',
+            currentTime: 10,
+            duration: 100,
+            timeListening: 1,
+            lastPlayedAt: 1,
+            dirty: true,
+          },
+          server: { currentTime: 80, lastUpdate: 9, duration: 100 },
+        },
+      ],
+    });
+    render(
+      <PlayerView
+        book={audiobookBook}
+        bookKey='h1-book'
+        controller={asController(new FakeController())}
+        onGoBack={vi.fn()}
+        onSelectEpisode={vi.fn()}
+        pendingEpisodeId={null}
+      />,
+    );
+    await waitFor(() => screen.getByRole('button', { name: 'Keep this device' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Keep this device' }));
+    await waitFor(() => expect(mocks.keepDevice).toHaveBeenCalled());
+    expect(mocks.keepServer).not.toHaveBeenCalled();
+  });
+
+  it('re-drains on reconnect while the player is open', async () => {
+    render(
+      <PlayerView
+        book={audiobookBook}
+        bookKey='h1-book'
+        controller={asController(new FakeController())}
+        onGoBack={vi.fn()}
+        onSelectEpisode={vi.fn()}
+        pendingEpisodeId={null}
+      />,
+    );
+    await waitFor(() => expect(mocks.drain).toHaveBeenCalled());
+    const calls = mocks.drain.mock.calls.length;
+    act(() => {
+      window.dispatchEvent(new Event('online'));
+    });
+    await waitFor(() => expect(mocks.drain.mock.calls.length).toBeGreaterThan(calls));
+  });
+});
+
+describe('EpisodesView nested download button', () => {
+  it('download click does not select the episode', () => {
+    const onSelect = vi.fn();
+    const onDownload = vi.fn();
+    const episode: ABSEpisode = { id: 'ep1', title: 'Episode One', duration: 60 };
+    render(
+      <EpisodesView
+        episodes={[episode]}
+        progressByEpisodeId={new Map()}
+        onSelectEpisode={onSelect}
+        onDownloadEpisode={onDownload}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText('Download'));
+    expect(onDownload).toHaveBeenCalledTimes(1);
+    expect(onSelect).not.toHaveBeenCalled();
   });
 });

@@ -560,9 +560,9 @@ describe('PlayerPage with a podcast show', () => {
     // Confirms the row actually went busy first - a route that never wires
     // pendingEpisodeId through would trivially "clear" a row that was never
     // marked busy in the first place.
-    expect(screen.getByText('Episode One').closest('button')?.getAttribute('aria-busy')).toBe(
-      'true',
-    );
+    expect(
+      screen.getByText('Episode One').closest('[role="button"]')?.getAttribute('aria-busy'),
+    ).toBe('true');
 
     await act(async () => {
       resolveClaim(null);
@@ -571,9 +571,9 @@ describe('PlayerPage with a podcast show', () => {
     // Pre-fix: nothing ever cleared pendingEpisodeId on a null result, so
     // the tapped row stayed aria-busy="true" forever.
     await waitFor(() =>
-      expect(screen.getByText('Episode One').closest('button')?.getAttribute('aria-busy')).toBe(
-        'false',
-      ),
+      expect(
+        screen.getByText('Episode One').closest('[role="button"]')?.getAttribute('aria-busy'),
+      ).toBe('false'),
     );
     expect(mocks.openAudiobookSession).toHaveBeenCalledTimes(1);
 
@@ -600,13 +600,13 @@ describe('PlayerPage with a podcast show', () => {
     await waitFor(() => expect(screen.getByText('Episode One')).toBeTruthy());
     fireEvent.click(screen.getByText('Episode One'));
 
-    expect(screen.getByText('Episode One').closest('button')?.getAttribute('aria-busy')).toBe(
-      'true',
-    );
+    expect(
+      screen.getByText('Episode One').closest('[role="button"]')?.getAttribute('aria-busy'),
+    ).toBe('true');
     // Only the tapped row is busy, not every row in the list.
-    expect(screen.getByText('Episode Two').closest('button')?.getAttribute('aria-busy')).toBe(
-      'false',
-    );
+    expect(
+      screen.getByText('Episode Two').closest('[role="button"]')?.getAttribute('aria-busy'),
+    ).toBe('false');
 
     await act(async () => {
       resolveClaim(null);

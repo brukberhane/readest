@@ -33,6 +33,20 @@ import { useCountdownLabel } from '@/app/reader/components/tts/useCountdownLabel
 import Dialog from '@/components/Dialog';
 import Spinner from '@/components/Spinner';
 import EpisodesView from './EpisodesView';
+import AbsOfflineControls from './AbsOfflineControls';
+import { isTauriAppPlatform } from '@/services/environment';
+import { absMediaDownloadManager } from '@/services/audiobookshelf/absMediaDownload';
+import {
+  drainAbsProgressOutbox,
+  keepDeviceProgress,
+  keepServerProgress,
+  setAbsOnScreenItem,
+  type AbsProgressConflict,
+} from '@/services/audiobookshelf/progressOutbox';
+import { createAbsClient } from '@/services/audiobookshelf/createClient';
+import { findABSServerById } from '@/store/absServerStore';
+import { useAbsMediaStore } from '@/store/absMediaStore';
+import { parseAbsFilePath } from '@/utils/audiobook';
 
 type PlayerSubView = 'main' | 'speed' | 'timer' | 'chapters' | 'episodes';
 
@@ -100,6 +114,38 @@ const PlayerView = ({
     () => ttsSessionManager.getSleepTimer()?.firesAt ?? 0,
   );
   const timerLabel = useCountdownLabel(timeoutTimestamp);
+  const [conflict, setConflict] = useState<AbsProgressConflict | null>(null);
+  const presence = useAbsMediaStore((s) => s.presence);
+
+  useEffect(() => {
+    const parsed = parseAbsFilePath(book.filePath);
+    if (parsed) {
+      setAbsOnScreenItem({ itemId: parsed.itemId, episodeId: controller.getEpisodeId() });
+    }
+    return () => setAbsOnScreenItem(null);
+  }, [book.filePath, controller]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      const svc = appService ?? (await envConfig.getAppService());
+      const parsed = parseAbsFilePath(book.filePath);
+      if (!parsed) return;
+      const result = await drainAbsProgressOutbox(svc, {
+        onScreen: { itemId: parsed.itemId, episodeId: controller.getEpisodeId() },
+      });
+      if (!cancelled) setConflict(result.dialogRows[0] ?? null);
+    };
+    void run();
+    const onOnline = () => {
+      void run();
+    };
+    window.addEventListener('online', onOnline);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('online', onOnline);
+    };
+  }, [appService, envConfig, book.filePath, controller]);
 
   // Playback state: the controller is the single source of truth, and
   // 'tts-state-change' is the same event the lock screen / NowPlayingBar
@@ -223,6 +269,51 @@ const PlayerView = ({
     void controller.seekToChapter(index);
     setView('main');
   };
+
+  const handleDownloadEpisode = async (episode: ABSEpisode) => {
+    const svc = appService ?? (await envConfig.getAppService());
+    await absMediaDownloadManager.queueEpisode({ appService: svc, book, episode });
+  };
+
+  const handleRemoveEpisode = async (episode: ABSEpisode) => {
+    const svc = appService ?? (await envConfig.getAppService());
+    await absMediaDownloadManager.removeDownload({
+      appService: svc,
+      bookHash: book.hash,
+      episodeId: episode.id,
+    });
+  };
+
+  const handleKeepServer = async () => {
+    if (!conflict) return;
+    keepServerProgress(conflict);
+    await controller.seekToTime(conflict.server.currentTime);
+    setConflict(null);
+  };
+
+  const handleKeepDevice = async () => {
+    if (!conflict) return;
+    const svc = appService ?? (await envConfig.getAppService());
+    const parsed = parseAbsFilePath(book.filePath);
+    const server = parsed ? findABSServerById(parsed.serverId) : undefined;
+    await keepDeviceProgress(
+      conflict,
+      server
+        ? createAbsClient(svc, server)
+        : {
+            getMe: async () => ({ mediaProgress: [] }),
+            syncLocalSession: async () => undefined,
+            patchProgress: async () => undefined,
+          },
+    );
+    setConflict(null);
+  };
+
+  const downloadStatusById = new Map(
+    Object.values(presence)
+      .filter((entry) => entry.bookHash === book.hash && entry.episodeId)
+      .map((entry) => [entry.episodeId!, { complete: entry.complete, inProgress: false }]),
+  );
 
   const chapters = controller.getChapters();
   const episodeId = controller.getEpisodeId();
@@ -401,6 +492,14 @@ const PlayerView = ({
             </button>
           )}
         </div>
+        {isTauriAppPlatform() && (
+          <AbsOfflineControls
+            book={book}
+            episodeId={episodeId}
+            appService={appService}
+            getAppService={() => envConfig.getAppService()}
+          />
+        )}
       </div>
       <Dialog
         id='player_picker_sheet'
@@ -479,10 +578,35 @@ const PlayerView = ({
               // prop (see the pending-controller effect above), it never
               // sets it, so no local wrapper is needed here.
               onSelectEpisode={onSelectEpisode}
+              onDownloadEpisode={isTauriAppPlatform() ? handleDownloadEpisode : undefined}
+              onRemoveEpisode={isTauriAppPlatform() ? handleRemoveEpisode : undefined}
+              downloadStatusById={downloadStatusById}
             />
           ) : (
             <Spinner loading />
           ))}
+      </Dialog>
+      <Dialog
+        id='abs_progress_conflict'
+        isOpen={conflict !== null}
+        onClose={() => setConflict(null)}
+        title={_('This device and the server have different playback positions.')}
+      >
+        <p className='text-start text-sm'>
+          {_('This device and the server have different playback positions.')}
+        </p>
+        <div className='mt-4 flex justify-end gap-2'>
+          <button type='button' className='btn btn-ghost' onClick={() => void handleKeepDevice()}>
+            {_('Keep this device')}
+          </button>
+          <button
+            type='button'
+            className='btn btn-contrast'
+            onClick={() => void handleKeepServer()}
+          >
+            {_('Keep server')}
+          </button>
+        </div>
       </Dialog>
     </div>
   );
