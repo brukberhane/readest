@@ -369,6 +369,30 @@ describe('ABSClient', () => {
       }),
     ).toBe('http://abs.local:13378/api/items/item1/file/abc');
   });
+
+  it('getItemExpanded copies nested metadata.size onto the track', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, {
+        id: 'item1',
+        mediaType: 'book',
+        media: {
+          metadata: { title: 'Pride' },
+          tracks: [
+            {
+              index: 1,
+              startOffset: 0,
+              duration: 10,
+              contentUrl: '/api/items/item1/file/abc',
+              mimeType: 'audio/mpeg',
+              metadata: { size: 4096 },
+            },
+          ],
+        },
+      }),
+    );
+    const item = await client.getItemExpanded('item1');
+    expect(item.media.tracks?.[0]?.size).toBe(4096);
+  });
 });
 
 describe('ABSClient on the web platform', () => {

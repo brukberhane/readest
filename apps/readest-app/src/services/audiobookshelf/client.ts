@@ -1,6 +1,7 @@
 import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
 import { isTauriAppPlatform } from '@/services/environment';
 import { runWithConcurrency } from '@/utils/concurrency';
+import { normalizeAbsItem } from '@/services/audiobookshelf/normalizeTrack';
 import type {
   ABSLibrary,
   ABSLibraryItem,
@@ -301,7 +302,8 @@ export class ABSClient {
   }
 
   async getItemExpanded(itemId: string): Promise<ABSLibraryItem> {
-    return this.#request<ABSLibraryItem>(`/api/items/${itemId}?expanded=1`);
+    const item = await this.#request<ABSLibraryItem>(`/api/items/${itemId}?expanded=1`);
+    return normalizeAbsItem(item);
   }
 
   async getMe(): Promise<{ mediaProgress: ABSMediaProgress[] }> {

@@ -39,6 +39,7 @@ interface AbsMediaState {
     serverId: string;
     label: string;
     priority?: number;
+    totalBytes?: number;
   }) => string;
   removeItem: (id: string) => void;
   setInProgress: (id: string) => void;
@@ -47,6 +48,7 @@ interface AbsMediaState {
   setPresence: (id: string, presence: AbsMediaPresence) => void;
   itemOf: (bookHash: string, episodeId?: string) => AbsMediaJob | undefined;
   presenceOf: (bookHash: string, episodeId?: string) => AbsMediaPresence | undefined;
+  requeueFailed: (id: string) => void;
   restoreItems: (items: Record<string, AbsMediaJob>) => void;
   restorePresence: (presence: Record<string, AbsMediaPresence>) => void;
 }
@@ -65,7 +67,7 @@ export const useAbsMediaStore = create<AbsMediaState>((set, get) => ({
       label: input.label,
       status: 'pending',
       doneBytes: 0,
-      totalBytes: 0,
+      totalBytes: input.totalBytes ?? 0,
       createdAt: Date.now(),
       priority: input.priority ?? 10,
       ...(input.episodeId ? { episodeId: input.episodeId } : {}),
@@ -121,6 +123,17 @@ export const useAbsMediaStore = create<AbsMediaState>((set, get) => ({
 
   itemOf: (bookHash, episodeId) => get().items[absMediaJobId(bookHash, episodeId)],
   presenceOf: (bookHash, episodeId) => get().presence[absMediaJobId(bookHash, episodeId)],
+
+  requeueFailed: (id) => {
+    const item = get().items[id];
+    if (!item || item.status !== 'failed') return;
+    set((state) => ({
+      items: {
+        ...state.items,
+        [id]: { ...item, status: 'pending', error: undefined, doneBytes: 0 },
+      },
+    }));
+  },
 
   restoreItems: (items) => {
     const restored: Record<string, AbsMediaJob> = {};

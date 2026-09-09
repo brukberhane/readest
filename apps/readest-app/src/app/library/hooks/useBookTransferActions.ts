@@ -7,6 +7,10 @@ import { useTranslation } from '@/hooks/useTranslation';
 import { useSettingsStore } from '@/store/settingsStore';
 import { eventDispatcher } from '@/utils/event';
 import { transferManager } from '@/services/transferManager';
+import { absMediaDownloadManager } from '@/services/audiobookshelf/absMediaDownload';
+import { isTauriAppPlatform } from '@/services/environment';
+import { isAudiobook } from '@/utils/audiobook';
+import { useTransferStore } from '@/store/transferStore';
 import {
   getActiveFileSyncBackends,
   isReadestCloudEnabled,
@@ -134,6 +138,21 @@ export const useBookTransferActions = (
   const handleBookDownload = useCallback(
     async (book: Book, downloadOptions: BookDownloadOptions = {}) => {
       const { redownload = false, queued = false, silent = false } = downloadOptions;
+      if (isAudiobook(book)) {
+        if (!appService) return false;
+        await absMediaDownloadManager.queueBook({ appService, book });
+        if (isTauriAppPlatform()) {
+          if (!silent) {
+            eventDispatcher.dispatch('toast', {
+              type: 'info',
+              timeout: 2000,
+              message: _('Download queued: {{title}}', { title: book.title }),
+            });
+          }
+          useTransferStore.getState().setIsTransferQueueOpen(true);
+        }
+        return true;
+      }
       const settingsNow = useSettingsStore.getState().settings;
       const backends = getActiveFileSyncBackends(settingsNow);
       const readest = isReadestCloudEnabled(settingsNow);

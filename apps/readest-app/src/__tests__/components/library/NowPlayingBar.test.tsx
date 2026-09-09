@@ -57,6 +57,7 @@ vi.mock('@/services/tts', () => ({
 
 import { eventDispatcher } from '@/utils/event';
 import NowPlayingBar from '@/app/library/components/NowPlayingBar';
+import { useAbsMediaStore } from '@/store/absMediaStore';
 
 const makeSession = (state = 'playing', kind: 'tts' | 'audiobook' = 'tts') => ({
   bookHash: 'hashA',
@@ -77,10 +78,12 @@ describe('NowPlayingBar', () => {
     getBookData.mockReturnValue({
       book: { title: 'Alice in Wonderland', coverImageUrl: null },
     });
+    useAbsMediaStore.setState({ items: {}, presence: {} });
   });
 
   afterEach(() => {
     cleanup();
+    useAbsMediaStore.setState({ items: {}, presence: {} });
   });
 
   test('renders nothing without an active session', () => {
@@ -162,5 +165,28 @@ describe('NowPlayingBar', () => {
     mockManager.sleepTimer = { timeoutSec: 600, firesAt: Date.now() + 90_000 };
     render(<NowPlayingBar isSelectMode={false} />);
     expect(screen.getByText(/^1:(2\d|30)$/)).toBeTruthy();
+  });
+
+  test('shows ABS download percent on an audiobook session chip', () => {
+    mockManager.session = makeSession('playing', 'audiobook');
+    useAbsMediaStore.setState({
+      items: {
+        hashA: {
+          id: 'hashA',
+          bookHash: 'hashA',
+          itemId: 'item1',
+          serverId: 'srv1',
+          label: 'Alice',
+          status: 'in_progress',
+          doneBytes: 40,
+          totalBytes: 80,
+          createdAt: 1,
+          priority: 10,
+        },
+      },
+      presence: {},
+    });
+    render(<NowPlayingBar isSelectMode={false} />);
+    expect(screen.getByText('50%')).toBeTruthy();
   });
 });

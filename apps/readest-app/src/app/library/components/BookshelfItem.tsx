@@ -23,6 +23,8 @@ import {
 import { md5Fingerprint } from '@/utils/md5';
 import { isTauriAppPlatform } from '@/services/environment';
 import { isLocalSendEnabled } from '@/services/localsend/devicePrefs';
+import { absMediaJobId, useAbsMediaStore } from '@/store/absMediaStore';
+import { isAudiobook } from '@/utils/audiobook';
 import BookItem from './BookItem';
 import GroupItem from './GroupItem';
 import BookContextMenuPopup, { type BookContextMenuItem } from './BookContextMenuPopup';
@@ -323,6 +325,9 @@ const BookshelfItem: React.FC<BookshelfItemProps> = ({
     };
     return getBookContextMenuItemIds(book, {
       localSend: isTauriAppPlatform() && isLocalSendEnabled(),
+      absOfflineComplete: isAudiobook(book)
+        ? !!useAbsMediaStore.getState().presence[absMediaJobId(book.hash)]?.complete
+        : false,
     }).map((id) => itemOptions[id]);
   };
 

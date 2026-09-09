@@ -27,7 +27,8 @@ const manager = new AbsMediaDownloadManager({
       (payload) => {
         input.onProgress({
           progress: payload.total > 0 ? payload.progress / payload.total : 0,
-          total: payload.total,
+          total: payload.total > 0 ? payload.total : undefined,
+          bytes: payload.progress,
         });
       },
       input.headers,
@@ -61,6 +62,20 @@ export const absMediaDownloadManager = {
     return manager.queueEpisode(input);
   },
   cancel: (id: string) => manager.cancel(id),
+  retry: async (id: string, appService?: AppService) => {
+    if (appService) bind(appService);
+    return manager.retry(id, appService);
+  },
+  retryAllFailed: async (appService?: AppService) => {
+    if (appService) bind(appService);
+    return manager.retryAllFailed(appService);
+  },
+  hydrate: (appService: AppService) => {
+    bind(appService);
+    manager.hydrate(appService);
+  },
+  clearFailed: () => manager.clearFailed(),
+  clearPending: () => manager.clearPending(),
   removeDownload: async (input: {
     appService: AppService;
     bookHash: string;

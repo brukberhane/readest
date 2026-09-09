@@ -25,6 +25,7 @@ import {
   type AbsSnapshotTrack,
   writeSnapshot as writeSnapshotToDisk,
   readSnapshot as readSnapshotFromDisk,
+  writeShowCache,
 } from '@/services/audiobookshelf/playbackSnapshot';
 import { findOutboxRow, upsertOutbox } from '@/services/audiobookshelf/progressOutbox';
 import {
@@ -37,7 +38,7 @@ export type AbsTrackDownloader = (input: {
   url: string;
   destAbsPath: string;
   headers: Record<string, string>;
-  onProgress: (p: { progress: number; total?: number }) => void;
+  onProgress: (p: { progress: number; total?: number; bytes?: number }) => void;
   signal?: AbortSignal;
 }) => Promise<void>;
 
@@ -62,6 +63,9 @@ interface PersistedQueueData {
 const isAbortError = (err: unknown): boolean =>
   (err instanceof DOMException && err.name === 'AbortError') ||
   (err instanceof Error && err.name === 'AbortError');
+
+const snapshotTotalBytes = (snapshot: AbsPlaybackSnapshot): number =>
+  snapshot.tracks.reduce((sum, track) => sum + (track.size ?? 0), 0);
 
 const snapshotForEpisode = (
   item: ABSLibraryItem,
@@ -127,18 +131,30 @@ export class AbsMediaDownloadManager {
     this.#appService = input.appService;
     const client = this.#deps.getClient(server);
     const item = await client.getItemExpanded(parsed.itemId);
+    if (item.mediaType === 'podcast' || input.book.absMediaType === 'podcast') {
+      await this.#queuePodcast({
+        appService: input.appService,
+        book: input.book,
+        item,
+        client,
+        parsed,
+      });
+      return;
+    }
     await this.#seedProgress(client, input.book.hash, parsed.itemId);
     const fresh = snapshotFromExpanded(item, input.book.hash, {
       title: input.book.title,
       author: input.book.author,
     });
     const existing = await this.#deps.readSnapshot(input.appService, input.book.hash);
-    await this.#deps.writeSnapshot(input.appService, mergeAbsSnapshot(fresh, existing));
+    const snapshot = mergeAbsSnapshot(fresh, existing);
+    await this.#deps.writeSnapshot(input.appService, snapshot);
     this.#enqueue({
       bookHash: input.book.hash,
       itemId: parsed.itemId,
       serverId: parsed.serverId,
       label: input.book.title,
+      totalBytes: snapshotTotalBytes(snapshot),
     });
     this.#persistQueue();
     await this.#processQueue();
@@ -167,13 +183,15 @@ export class AbsMediaDownloadManager {
       input.book.hash,
       input.episode.id,
     );
-    await this.#deps.writeSnapshot(input.appService, mergeAbsSnapshot(fresh, existing));
+    const snapshot = mergeAbsSnapshot(fresh, existing);
+    await this.#deps.writeSnapshot(input.appService, snapshot);
     this.#enqueue({
       bookHash: input.book.hash,
       episodeId: input.episode.id,
       itemId: parsed.itemId,
       serverId: parsed.serverId,
       label: input.episode.title,
+      totalBytes: snapshotTotalBytes(snapshot),
     });
     this.#persistQueue();
     await this.#processQueue();
@@ -184,6 +202,48 @@ export class AbsMediaDownloadManager {
     if (this.#active?.id === id) this.#active.abort.abort();
     useAbsMediaStore.getState().removeItem(id);
     this.#persistQueue();
+  }
+
+  hydrate(appService: AppService): void {
+    this.#appService = appService;
+    this.#ensureLoaded();
+    void this.#processQueue();
+  }
+
+  async retry(id: string, appService?: AppService): Promise<void> {
+    this.#ensureLoaded();
+    if (appService) this.#appService = appService;
+    useAbsMediaStore.getState().requeueFailed(id);
+    this.#persistQueue();
+    await this.#processQueue();
+  }
+
+  async retryAllFailed(appService?: AppService): Promise<void> {
+    this.#ensureLoaded();
+    if (appService) this.#appService = appService;
+    const store = useAbsMediaStore.getState();
+    for (const item of Object.values(store.items)) {
+      if (item.status === 'failed') store.requeueFailed(item.id);
+    }
+    this.#persistQueue();
+    await this.#processQueue();
+  }
+
+  clearFailed(): void {
+    this.#ensureLoaded();
+    const store = useAbsMediaStore.getState();
+    for (const item of Object.values(store.items)) {
+      if (item.status === 'failed') store.removeItem(item.id);
+    }
+    this.#persistQueue();
+  }
+
+  clearPending(): void {
+    this.#ensureLoaded();
+    const store = useAbsMediaStore.getState();
+    for (const item of Object.values(store.items)) {
+      if (item.status === 'pending' || item.status === 'in_progress') this.cancel(item.id);
+    }
   }
 
   async removeDownload(input: {
@@ -204,10 +264,78 @@ export class AbsMediaDownloadManager {
     this.#persistIndex();
   }
 
+  async #queuePodcast(input: {
+    appService: AppService;
+    book: Book;
+    item: ABSLibraryItem;
+    client: AbsDownloadClient;
+    parsed: { serverId: string; itemId: string };
+  }): Promise<void> {
+    const { appService, book, item, client, parsed } = input;
+    const episodes = (item.media.episodes ?? []).filter((episode) => episode.audioTrack);
+    await writeShowCache(appService, book.hash, {
+      version: 1,
+      itemId: parsed.itemId,
+      savedAt: Date.now(),
+      episodes: item.media.episodes ?? [],
+    });
+    try {
+      const me = await client.getMe();
+      for (const episode of episodes) {
+        this.#applyProgress(me, book.hash, parsed.itemId, episode.id);
+      }
+    } catch (err) {
+      console.warn(err);
+    }
+    const store = useAbsMediaStore.getState();
+    for (const episode of episodes) {
+      if (store.presenceOf(book.hash, episode.id)?.complete) continue;
+      const fresh = snapshotForEpisode(item, book, episode);
+      const existing = await this.#deps.readSnapshot(appService, book.hash, episode.id);
+      const snapshot = mergeAbsSnapshot(fresh, existing);
+      await this.#deps.writeSnapshot(appService, snapshot);
+      this.#enqueue({
+        bookHash: book.hash,
+        episodeId: episode.id,
+        itemId: parsed.itemId,
+        serverId: parsed.serverId,
+        label: episode.title,
+        totalBytes: snapshotTotalBytes(snapshot),
+      });
+    }
+    this.#persistQueue();
+    await this.#processQueue();
+  }
+
   #webToast(): void {
     eventDispatcher.dispatch('toast', {
       message: _('Offline playback is only available in the desktop and mobile apps'),
       type: 'info',
+    });
+  }
+
+  #toastComplete(job: AbsMediaJob): void {
+    const busy = Object.values(useAbsMediaStore.getState().items).some(
+      (item) =>
+        item.id !== job.id &&
+        item.bookHash === job.bookHash &&
+        (item.status === 'pending' || item.status === 'in_progress'),
+    );
+    if (busy) return;
+    eventDispatcher.dispatch('toast', {
+      message: _('Downloaded: {{title}}').replace('{{title}}', job.label),
+      type: 'info',
+    });
+  }
+
+  #toastFail(job: AbsMediaJob, error?: string): void {
+    eventDispatcher.dispatch('toast', {
+      message: error
+        ? _('Failed to download {{title}}: {{error}}')
+            .replace('{{title}}', job.label)
+            .replace('{{error}}', error)
+        : _('Failed to download {{title}}').replace('{{title}}', job.label),
+      type: 'error',
     });
   }
 
@@ -217,6 +345,7 @@ export class AbsMediaDownloadManager {
     itemId: string;
     serverId: string;
     label: string;
+    totalBytes?: number;
   }): void {
     const store = useAbsMediaStore.getState();
     const existing = store.itemOf(input.bookHash, input.episodeId);
@@ -258,11 +387,15 @@ export class AbsMediaDownloadManager {
       const server = this.#deps.getServer(job.serverId);
       if (!server) throw new Error('Audiobookshelf server not found');
       const client = this.#deps.getClient(server);
-      const totalKnown = snapshot.tracks.reduce((sum, track) => sum + (track.size ?? 0), 0);
-      let completedBytes = snapshot.tracks
-        .filter((track) => track.complete)
-        .reduce((sum, track) => sum + (track.size ?? 0), 0);
-      let doneTracks = snapshot.tracks.filter((track) => track.complete).length;
+      const progress = {
+        knownTotal: snapshotTotalBytes(snapshot),
+        completedBytes: snapshot.tracks
+          .filter((track) => track.complete)
+          .reduce((sum, track) => sum + (track.size ?? 0), 0),
+      };
+      if (progress.knownTotal > 0) {
+        store.updateProgress(job.id, progress.completedBytes, progress.knownTotal);
+      }
 
       for (const track of snapshot.tracks) {
         if (track.complete) continue;
@@ -275,27 +408,17 @@ export class AbsMediaDownloadManager {
           server,
           appService,
           signal: abort.signal,
-          totalKnown,
-          completedBytes,
-          doneTracks,
+          progress,
         });
-        const updated = snapshot.tracks.find((t) => t.fileId === track.fileId);
-        completedBytes += updated?.size ?? track.size ?? 0;
-        doneTracks += 1;
-        if (totalKnown > 0) {
-          store.updateProgress(job.id, completedBytes, totalKnown);
-        } else {
-          store.updateProgress(job.id, doneTracks, 0);
+        if (progress.knownTotal > 0) {
+          store.updateProgress(job.id, progress.completedBytes, progress.knownTotal);
         }
       }
 
       if (abort.signal.aborted || !useAbsMediaStore.getState().items[job.id]) return;
       const finalSnap = await this.#deps.readSnapshot(appService, job.bookHash, job.episodeId);
       const complete = !!finalSnap && snapshotIsComplete(finalSnap);
-      const bytes = (finalSnap?.tracks ?? []).reduce(
-        (sum, track) => sum + (track.size ?? 0),
-        completedBytes,
-      );
+      const bytes = snapshotTotalBytes(finalSnap ?? snapshot) || progress.completedBytes;
       const presence: AbsMediaPresence = {
         bookHash: job.bookHash,
         ...(job.episodeId ? { episodeId: job.episodeId } : {}),
@@ -305,18 +428,20 @@ export class AbsMediaDownloadManager {
       store.setPresence(job.id, presence);
       this.#persistIndex();
       if (complete) {
+        this.#toastComplete(job);
         store.removeItem(job.id);
         this.#persistQueue();
       } else {
         store.setFailed(job.id, 'Download incomplete');
         this.#persistQueue();
+        this.#toastFail(job, 'Download incomplete');
       }
     } catch (err) {
       if (isAbortError(err) || !useAbsMediaStore.getState().items[job.id]) return;
-      useAbsMediaStore
-        .getState()
-        .setFailed(job.id, err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      useAbsMediaStore.getState().setFailed(job.id, message);
       this.#persistQueue();
+      this.#toastFail(job, message);
     } finally {
       if (this.#active?.id === job.id) this.#active = null;
     }
@@ -330,12 +455,9 @@ export class AbsMediaDownloadManager {
     server: ABSServer;
     appService: AppService;
     signal: AbortSignal;
-    totalKnown: number;
-    completedBytes: number;
-    doneTracks: number;
+    progress: { knownTotal: number; completedBytes: number };
   }): Promise<void> {
-    const { job, track, snapshot, client, server, appService, signal, totalKnown, completedBytes } =
-      input;
+    const { job, track, snapshot, client, server, appService, signal, progress } = input;
     const partRel = `${track.relPath}.part`;
     const destAbsPath = await this.#deps.resolveAbsPath(partRel);
     const url = client.downloadUrlForTrack(job.itemId, {
@@ -359,16 +481,18 @@ export class AbsMediaDownloadManager {
         headers,
         signal,
         onProgress: (p) => {
-          const trackSize = track.size && track.size > 0 ? track.size : (p.total ?? 0);
-          if (totalKnown > 0 && track.size) {
-            useAbsMediaStore
-              .getState()
-              .updateProgress(job.id, completedBytes + p.progress * track.size, totalKnown);
-          } else if (trackSize > 0) {
-            useAbsMediaStore
-              .getState()
-              .updateProgress(job.id, completedBytes + p.progress * trackSize, totalKnown);
+          if ((!track.size || track.size <= 0) && p.total && p.total > 0) {
+            track.size = p.total;
+            progress.knownTotal = snapshotTotalBytes(snapshot);
           }
+          const trackSize = track.size && track.size > 0 ? track.size : (p.total ?? 0);
+          const doneInTrack =
+            p.bytes != null && p.bytes > 0
+              ? Math.min(p.bytes, trackSize || p.bytes)
+              : p.progress * trackSize;
+          useAbsMediaStore
+            .getState()
+            .updateProgress(job.id, progress.completedBytes + doneInTrack, progress.knownTotal);
         },
       });
       if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -386,8 +510,11 @@ export class AbsMediaDownloadManager {
       if (track.size != null && track.size > 0 && st.size !== track.size) {
         throw new Error('Downloaded file size mismatch');
       }
+      if (!track.size || track.size <= 0) track.size = st.size;
       track.complete = true;
       snapshot.updatedAt = Date.now();
+      progress.completedBytes += track.size;
+      progress.knownTotal = snapshotTotalBytes(snapshot);
       await this.#deps.writeSnapshot(appService, snapshot);
     } catch (err) {
       await this.#deps.deleteFile(partRel, 'Books').catch(() => undefined);
@@ -403,37 +530,46 @@ export class AbsMediaDownloadManager {
   ): Promise<void> {
     try {
       const me = await client.getMe();
-      const progress = me.mediaProgress.find(
-        (entry) =>
-          entry.libraryItemId === itemId &&
-          (entry.episodeId || undefined) === (episodeId || undefined),
-      );
-      if (!progress) return;
-      const localPlayed = readLocalLastPlayedAt(bookHash, episodeId);
-      if (!isLocalProgressFresher(localPlayed, progress.lastUpdate)) {
-        writeLocalPos(bookHash, progress.currentTime, episodeId);
-      }
-      const existing = findOutboxRow(itemId, episodeId);
-      const localWins = isLocalProgressFresher(localPlayed, progress.lastUpdate);
-      upsertOutbox({
-        bookHash,
-        itemId,
-        ...(episodeId ? { episodeId } : {}),
-        localSessionId: existing?.localSessionId ?? '',
-        currentTime: existing?.dirty
-          ? existing.currentTime
-          : localWins
-            ? (existing?.currentTime ?? progress.currentTime)
-            : progress.currentTime,
-        duration: progress.duration,
-        timeListening: existing?.timeListening ?? 0,
-        lastPlayedAt: existing?.lastPlayedAt ?? 0,
-        dirty: existing?.dirty ?? false,
-        serverLastUpdateCached: progress.lastUpdate,
-      });
+      this.#applyProgress(me, bookHash, itemId, episodeId);
     } catch (err) {
       console.warn(err);
     }
+  }
+
+  #applyProgress(
+    me: { mediaProgress: ABSMediaProgress[] },
+    bookHash: string,
+    itemId: string,
+    episodeId?: string,
+  ): void {
+    const progress = me.mediaProgress.find(
+      (entry) =>
+        entry.libraryItemId === itemId &&
+        (entry.episodeId || undefined) === (episodeId || undefined),
+    );
+    if (!progress) return;
+    const localPlayed = readLocalLastPlayedAt(bookHash, episodeId);
+    if (!isLocalProgressFresher(localPlayed, progress.lastUpdate)) {
+      writeLocalPos(bookHash, progress.currentTime, episodeId);
+    }
+    const existing = findOutboxRow(itemId, episodeId);
+    const localWins = isLocalProgressFresher(localPlayed, progress.lastUpdate);
+    upsertOutbox({
+      bookHash,
+      itemId,
+      ...(episodeId ? { episodeId } : {}),
+      localSessionId: existing?.localSessionId ?? '',
+      currentTime: existing?.dirty
+        ? existing.currentTime
+        : localWins
+          ? (existing?.currentTime ?? progress.currentTime)
+          : progress.currentTime,
+      duration: progress.duration,
+      timeListening: existing?.timeListening ?? 0,
+      lastPlayedAt: existing?.lastPlayedAt ?? 0,
+      dirty: existing?.dirty ?? false,
+      serverLastUpdateCached: progress.lastUpdate,
+    });
   }
 
   #ensureLoaded(): void {

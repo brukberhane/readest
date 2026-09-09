@@ -14,7 +14,15 @@ import type { AudiobookController } from '@/services/audiobook/AudiobookControll
 // coverage rather than staying reachable only through the mocked-out route.
 
 vi.mock('@/hooks/useTranslation', () => ({
-  useTranslation: () => (key: string) => key,
+  useTranslation:
+    () =>
+    (text: string, params?: Record<string, string | number>): string => {
+      if (!params) return text;
+      return Object.entries(params).reduce(
+        (acc, [k, v]) => acc.replace(`{{${k}}}`, String(v)),
+        text,
+      );
+    },
 }));
 
 vi.mock('@/hooks/useResponsiveSize', () => ({
@@ -48,6 +56,7 @@ const mocks = vi.hoisted(() => ({
   queueEpisode: vi.fn(),
   cancelDownload: vi.fn(),
   removeDownload: vi.fn(),
+  retryDownload: vi.fn(),
   drain: vi.fn(async () => ({ dialogRows: [] as unknown[] })),
   keepServer: vi.fn(),
   keepDevice: vi.fn(),
@@ -85,6 +94,7 @@ vi.mock('@/services/audiobookshelf/absMediaDownload', () => ({
     queueEpisode: mocks.queueEpisode,
     cancel: mocks.cancelDownload,
     removeDownload: mocks.removeDownload,
+    retry: mocks.retryDownload,
   },
 }));
 
@@ -614,6 +624,7 @@ describe('PlayerView offline download control', () => {
     mocks.keepServer.mockClear();
     mocks.keepDevice.mockClear();
     mocks.queueBook.mockClear();
+    mocks.retryDownload.mockClear();
     envConfig.getAppService.mockResolvedValue({});
     useAbsMediaStore.setState({ items: {}, presence: {} });
   });
@@ -658,6 +669,70 @@ describe('PlayerView offline download control', () => {
       />,
     );
     expect(screen.queryByLabelText('Download')).toBeNull();
+  });
+
+  it('shows download percent while a job is in progress', () => {
+    useAbsMediaStore.setState({
+      items: {
+        h1: {
+          id: 'h1',
+          bookHash: 'h1',
+          itemId: 'item1',
+          serverId: 'srv1',
+          label: 'Pride',
+          status: 'in_progress',
+          doneBytes: 50,
+          totalBytes: 100,
+          createdAt: 1,
+          priority: 10,
+        },
+      },
+      presence: {},
+    });
+    render(
+      <PlayerView
+        book={audiobookBook}
+        bookKey='h1-book'
+        controller={asController(new FakeController())}
+        onGoBack={vi.fn()}
+        onSelectEpisode={vi.fn()}
+        pendingEpisodeId={null}
+      />,
+    );
+    expect(screen.getByRole('button', { name: 'Downloading 50%' })).toBeTruthy();
+  });
+
+  it('retries a failed job from the player control', async () => {
+    useAbsMediaStore.setState({
+      items: {
+        h1: {
+          id: 'h1',
+          bookHash: 'h1',
+          itemId: 'item1',
+          serverId: 'srv1',
+          label: 'Pride',
+          status: 'failed',
+          doneBytes: 0,
+          totalBytes: 100,
+          error: 'network',
+          createdAt: 1,
+          priority: 10,
+        },
+      },
+      presence: {},
+    });
+    render(
+      <PlayerView
+        book={audiobookBook}
+        bookKey='h1-book'
+        controller={asController(new FakeController())}
+        onGoBack={vi.fn()}
+        onSelectEpisode={vi.fn()}
+        pendingEpisodeId={null}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(mocks.retryDownload).toHaveBeenCalled());
   });
 
   it('keep-server seeks to the server position without syncLocalSession', async () => {

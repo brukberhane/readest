@@ -1,5 +1,6 @@
 import type { ABSChapter, ABSEpisode, ABSLibraryItem, ABSTrack } from '@/types/audiobookshelf';
 import type { AppService } from '@/types/system';
+import { normalizeAbsTrack } from '@/services/audiobookshelf/normalizeTrack';
 
 export const ABS_SNAPSHOT_VERSION = 1 as const;
 
@@ -185,17 +186,18 @@ export const snapshotFromExpanded = (
     duration: item.media.duration ?? tracks.reduce((sum, track) => sum + track.duration, 0),
     chapters: item.media.chapters ?? [],
     tracks: tracks.map((track) => {
-      const fileId = fileIdFromTrack(track);
-      const ext = extFromMime(track.mimeType);
+      const normalized = normalizeAbsTrack(track);
+      const fileId = fileIdFromTrack(normalized);
+      const ext = extFromMime(normalized.mimeType);
       return {
-        index: track.index,
-        startOffset: track.startOffset,
-        duration: track.duration,
-        contentUrl: track.contentUrl,
-        mimeType: track.mimeType,
+        index: normalized.index,
+        startOffset: normalized.startOffset,
+        duration: normalized.duration,
+        contentUrl: normalized.contentUrl,
+        mimeType: normalized.mimeType,
         fileId,
         relPath: absTrackRelPath(bookHash, fileId, ext, meta.episodeId),
-        ...(track.size != null ? { size: track.size } : {}),
+        ...(normalized.size != null ? { size: normalized.size } : {}),
         complete: false,
       };
     }),

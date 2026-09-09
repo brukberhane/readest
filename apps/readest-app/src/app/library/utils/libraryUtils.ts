@@ -14,6 +14,7 @@ import { md5Fingerprint } from '@/utils/md5';
 import { stubTranslation as _ } from '@/utils/misc';
 import { SIZE_PER_LOC, SIZE_PER_TIME_UNIT } from '@/services/constants';
 import { isFeedBook } from '@/services/rss/feedBookUrl';
+import { isAudiobook } from '@/utils/audiobook';
 
 /** Valid sort types for the library */
 const VALID_SORT_TYPES: LibrarySortByType[] = Object.values(LibrarySortByType);
@@ -183,16 +184,16 @@ export const selectDownloadableBooks = (
   ids: string[],
   items: (Book | BooksGroup)[],
   books: Book[],
+  opts?: { absPresence?: Record<string, { bookHash: string; complete: boolean }> },
 ): Book[] => {
   const hashes = new Set(expandBookshelfSelection(ids, items));
-  return books.filter(
-    (book) =>
-      hashes.has(book.hash) &&
-      !book.deletedAt &&
-      !isFeedBook(book) &&
-      !!book.uploadedAt &&
-      !book.downloadedAt,
-  );
+  return books.filter((book) => {
+    if (!hashes.has(book.hash) || book.deletedAt || isFeedBook(book)) return false;
+    if (isAudiobook(book)) {
+      return opts?.absPresence?.[book.hash]?.complete !== true;
+    }
+    return !!book.uploadedAt && !book.downloadedAt;
+  });
 };
 
 // Calibre custom column names and values, flattened for searching (#4811).
@@ -1009,7 +1010,7 @@ export const pickFresherMetadata = (
  */
 export const getBookContextMenuItemIds = (
   book: Book,
-  opts?: { localSend?: boolean },
+  opts?: { localSend?: boolean; absOfflineComplete?: boolean },
 ): BookContextMenuItemId[] => {
   const ids: BookContextMenuItemId[] = ['select', 'group'];
   ids.push(book.readingStatus === 'finished' ? 'markUnread' : 'markFinished');
@@ -1025,7 +1026,11 @@ export const getBookContextMenuItemIds = (
   ids.push('showDetails', 'showInFinder', 'searchGoodreads');
   // A feed book has no file to move: every transfer action would fail, and the
   // share dialog uploads before it can hand out a link (issue #5307).
-  if (!isFeedBook(book)) {
+  // ABS stubs are streamable and never carry uploadedAt/downloadedAt; Download
+  // here means cache audio locally, not pull a Readest Cloud file.
+  if (isAudiobook(book)) {
+    if (!opts?.absOfflineComplete) ids.push('download');
+  } else if (!isFeedBook(book)) {
     if (book.uploadedAt && !book.downloadedAt) ids.push('download');
     if (!book.uploadedAt && book.downloadedAt) ids.push('upload');
     // Share is offered for any local-or-uploaded book; the dialog uploads first

@@ -1491,6 +1491,20 @@ describe('selectDownloadableBooks', () => {
   it('returns an empty array when nothing is selected', () => {
     expect(selectDownloadableBooks([], [], [])).toEqual([]);
   });
+
+  it('includes an ABS book that is not cached locally', () => {
+    const abs = createMockBook({ hash: 'abs-1', format: 'ABS' });
+    expect(selectDownloadableBooks(['abs-1'], [abs], [abs])).toEqual([abs]);
+  });
+
+  it('skips an ABS book whose offline cache is already complete', () => {
+    const abs = createMockBook({ hash: 'abs-1', format: 'ABS' });
+    expect(
+      selectDownloadableBooks(['abs-1'], [abs], [abs], {
+        absPresence: { 'abs-1': { bookHash: 'abs-1', complete: true } },
+      }),
+    ).toEqual([]);
+  });
 });
 
 describe('buildGroupNameUpdatedAt', () => {

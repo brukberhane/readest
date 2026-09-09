@@ -4,6 +4,9 @@ import { useEffect, useState } from 'react';
 import { MdClose, MdPauseCircleFilled, MdPlayCircleFilled } from 'react-icons/md';
 import { ttsSessionManager, TTSSession } from '@/services/tts';
 import { asAudiobookController } from '@/services/audiobook/AudiobookController';
+import { useAbsMediaStore } from '@/store/absMediaStore';
+import { absJobProgressPercent } from '@/utils/absMediaProgress';
+import { INDETERMINATE_PROGRESS } from '@/utils/transfer';
 import { useResponsiveSize } from '@/hooks/useResponsiveSize';
 import { useBookDataStore } from '@/store/bookDataStore';
 import { useLibraryStore } from '@/store/libraryStore';
@@ -42,6 +45,7 @@ const NowPlayingBar = ({ isSelectMode }: NowPlayingBarProps) => {
   const [stopping, setStopping] = useState(false);
   const [entered, setEntered] = useState(false);
   const [timerLabel, setTimerLabel] = useState('');
+  const absItems = useAbsMediaStore((state) => state.items);
   const size20 = useResponsiveSize(20);
   const size30 = useResponsiveSize(30);
 
@@ -111,6 +115,18 @@ const NowPlayingBar = ({ isSelectMode }: NowPlayingBarProps) => {
   const title = book?.title ?? '';
   const coverImageUrl = book?.coverImageUrl;
   const isAudiobookSession = !!asAudiobookController(session.controller);
+  const absDownloadLabel = (() => {
+    if (!isAudiobookSession) return '';
+    const jobs = Object.values(absItems).filter(
+      (job) =>
+        job.bookHash === session.bookHash &&
+        (job.status === 'pending' || job.status === 'in_progress'),
+    );
+    if (jobs.length === 0) return '';
+    const chosen = jobs.find((job) => job.status === 'in_progress') ?? jobs[0]!;
+    const pct = absJobProgressPercent(chosen);
+    return pct === INDETERMINATE_PROGRESS ? _('Downloading') : `${pct}%`;
+  })();
 
   const handleToggle = () => {
     const controller = session.controller;
@@ -170,6 +186,9 @@ const NowPlayingBar = ({ isSelectMode }: NowPlayingBarProps) => {
           />
         ) : null}
         <span className='min-w-0 flex-1 truncate text-sm'>{title}</span>
+        {absDownloadLabel && (
+          <span className='shrink-0 text-xs tabular-nums opacity-70'>{absDownloadLabel}</span>
+        )}
         {timerLabel && (
           <span className='shrink-0 text-xs tabular-nums opacity-70'>{timerLabel}</span>
         )}

@@ -459,4 +459,198 @@ describe('AbsMediaDownloadManager', () => {
     expect(snap?.tracks.some((t) => t.complete)).toBe(false);
     expect(useAbsMediaStore.getState().presenceOf('h1')?.complete).not.toBe(true);
   });
+
+  it('records byte progress while a track downloads', async () => {
+    const { appService, files } = makeFs();
+    const seen: { done: number; total: number }[] = [];
+    const downloadTrack = vi.fn(
+      async (input: {
+        destAbsPath: string;
+        url: string;
+        headers: Record<string, string>;
+        onProgress: (p: { progress: number; total?: number }) => void;
+      }) => {
+        const size = input.url.endsWith('/a') ? 10 : 20;
+        input.onProgress({ progress: 0.5, total: size });
+        const job = useAbsMediaStore.getState().itemOf('h1')!;
+        seen.push({ done: job.doneBytes, total: job.totalBytes });
+        files.set(input.destAbsPath, 'x'.repeat(size));
+        input.onProgress({ progress: 1, total: size });
+      },
+    );
+    const manager = new AbsMediaDownloadManager({
+      downloadTrack,
+      resolveAbsPath: async (rel) => rel,
+      exists: appService.exists.bind(appService),
+      stats: appService.stats.bind(appService),
+      createDir: appService.createDir.bind(appService),
+      deleteFile: appService.deleteFile.bind(appService),
+      deleteDir: appService.deleteDir.bind(appService),
+      copyFile: appService.copyFile.bind(appService),
+      writeSnapshot,
+      readSnapshot,
+      isTauri: () => true,
+      getClient: () => ({
+        getItemExpanded: async () => twoTrackItem,
+        getMe: async () => ({ mediaProgress: [] }),
+        downloadUrlForTrack: (_id, track) => `http://abs.local${track.contentUrl}`,
+      }),
+      getServer: () => server,
+    });
+
+    await manager.queueBook({ appService, book });
+    expect(seen[0]?.total).toBe(30);
+    expect(seen[0]?.done).toBeGreaterThan(0);
+  });
+
+  it('uses onProgress total when the snapshot has no track sizes', async () => {
+    const { appService, files } = makeFs();
+    const item: ABSLibraryItem = {
+      ...twoTrackItem,
+      media: {
+        ...twoTrackItem.media,
+        tracks: twoTrackItem.media.tracks!.map(({ size: _size, ...track }) => track),
+      },
+    };
+    const downloadTrack = vi.fn(
+      async (input: {
+        destAbsPath: string;
+        url: string;
+        headers: Record<string, string>;
+        onProgress: (p: { progress: number; total?: number }) => void;
+      }) => {
+        files.set(input.destAbsPath, 'x'.repeat(12));
+        input.onProgress({ progress: 1, total: 12 });
+      },
+    );
+    const manager = new AbsMediaDownloadManager({
+      downloadTrack,
+      resolveAbsPath: async (rel) => rel,
+      exists: appService.exists.bind(appService),
+      stats: appService.stats.bind(appService),
+      createDir: appService.createDir.bind(appService),
+      deleteFile: appService.deleteFile.bind(appService),
+      deleteDir: appService.deleteDir.bind(appService),
+      copyFile: appService.copyFile.bind(appService),
+      writeSnapshot,
+      readSnapshot,
+      isTauri: () => true,
+      getClient: () => ({
+        getItemExpanded: async () => item,
+        getMe: async () => ({ mediaProgress: [] }),
+        downloadUrlForTrack: (_id, track) => `http://abs.local${track.contentUrl}`,
+      }),
+      getServer: () => server,
+    });
+
+    await manager.queueBook({ appService, book });
+    await vi.waitFor(() =>
+      expect(useAbsMediaStore.getState().presenceOf('h1')?.complete).toBe(true),
+    );
+  });
+
+  it('retries a failed job without a second getItemExpanded', async () => {
+    const { appService, files } = makeFs();
+    let attempts = 0;
+    const downloadTrack = vi.fn(
+      async (input: {
+        destAbsPath: string;
+        url: string;
+        headers: Record<string, string>;
+        onProgress: (p: { progress: number; total?: number }) => void;
+      }) => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('network');
+        const size = input.url.endsWith('/a') ? 10 : 20;
+        files.set(input.destAbsPath, 'x'.repeat(size));
+        input.onProgress({ progress: 1, total: size });
+      },
+    );
+    const getItemExpanded = vi.fn(async () => twoTrackItem);
+    const manager = new AbsMediaDownloadManager({
+      downloadTrack,
+      resolveAbsPath: async (rel) => rel,
+      exists: appService.exists.bind(appService),
+      stats: appService.stats.bind(appService),
+      createDir: appService.createDir.bind(appService),
+      deleteFile: appService.deleteFile.bind(appService),
+      deleteDir: appService.deleteDir.bind(appService),
+      copyFile: appService.copyFile.bind(appService),
+      writeSnapshot,
+      readSnapshot,
+      isTauri: () => true,
+      getClient: () => ({
+        getItemExpanded,
+        getMe: async () => ({ mediaProgress: [] }),
+        downloadUrlForTrack: (_id, track) => `http://abs.local${track.contentUrl}`,
+      }),
+      getServer: () => server,
+    });
+
+    await manager.queueBook({ appService, book });
+    await vi.waitFor(() => expect(useAbsMediaStore.getState().itemOf('h1')?.status).toBe('failed'));
+    await manager.retry('h1');
+    await vi.waitFor(() =>
+      expect(useAbsMediaStore.getState().presenceOf('h1')?.complete).toBe(true),
+    );
+    expect(getItemExpanded).toHaveBeenCalledTimes(1);
+  });
+
+  it('queueBook on a podcast enqueues every episode', async () => {
+    const { appService, files } = makeFs();
+    const second: ABSEpisode = {
+      id: 'ep2',
+      title: 'Episode Two',
+      duration: 10,
+      audioTrack: {
+        index: 1,
+        startOffset: 0,
+        duration: 10,
+        contentUrl: '/api/items/item1/file/ep2',
+        mimeType: 'audio/mpeg',
+        ino: 'ep2',
+        size: 8,
+      },
+    };
+    const show: ABSLibraryItem = {
+      ...podcastItem,
+      media: { ...podcastItem.media, episodes: [episode, second] },
+    };
+    const downloadTrack = vi.fn(
+      async (input: {
+        destAbsPath: string;
+        url: string;
+        headers: Record<string, string>;
+        onProgress: (p: { progress: number; total?: number }) => void;
+      }) => {
+        files.set(input.destAbsPath, 'x'.repeat(8));
+        input.onProgress({ progress: 1, total: 8 });
+      },
+    );
+    const manager = new AbsMediaDownloadManager({
+      downloadTrack,
+      resolveAbsPath: async (rel) => rel,
+      exists: appService.exists.bind(appService),
+      stats: appService.stats.bind(appService),
+      createDir: appService.createDir.bind(appService),
+      deleteFile: appService.deleteFile.bind(appService),
+      deleteDir: appService.deleteDir.bind(appService),
+      copyFile: appService.copyFile.bind(appService),
+      writeSnapshot,
+      readSnapshot,
+      isTauri: () => true,
+      getClient: () => ({
+        getItemExpanded: async () => show,
+        getMe: async () => ({ mediaProgress: [] }),
+        downloadUrlForTrack: (_id, track) => `http://abs.local${track.contentUrl}`,
+      }),
+      getServer: () => server,
+    });
+
+    await manager.queueBook({ appService, book: { ...book, absMediaType: 'podcast' } });
+    await vi.waitFor(() => {
+      expect(useAbsMediaStore.getState().presenceOf('h1', 'ep1')?.complete).toBe(true);
+      expect(useAbsMediaStore.getState().presenceOf('h1', 'ep2')?.complete).toBe(true);
+    });
+  });
 });

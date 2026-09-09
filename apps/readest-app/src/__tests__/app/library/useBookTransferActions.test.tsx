@@ -64,6 +64,16 @@ vi.mock('@/services/transferManager', () => ({
   },
 }));
 
+const queueAbsBook = vi.hoisted(() => vi.fn(async () => undefined));
+vi.mock('@/services/audiobookshelf/absMediaDownload', () => ({
+  absMediaDownloadManager: { queueBook: queueAbsBook },
+}));
+
+vi.mock('@/services/environment', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/services/environment')>();
+  return { ...actual, isTauriAppPlatform: vi.fn(() => true) };
+});
+
 const { useBookTransferActions } = await import('@/app/library/hooks/useBookTransferActions');
 const { eventDispatcher } = await import('@/utils/event');
 
@@ -282,5 +292,16 @@ describe('useBookTransferActions download routing (issue #5062)', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('queues an ABS book through AbsMediaDownloadManager, not Cloud transferManager', async () => {
+    const appService = {} as AppService;
+    const { result } = setup(appService);
+    const book = makeBook({ format: 'ABS', filePath: 'abs://srv/item' });
+    const ok = await result.current.handleBookDownload(book, { queued: true });
+
+    expect(ok).toBe(true);
+    expect(queueAbsBook).toHaveBeenCalledWith({ appService, book });
+    expect(queueDownload).not.toHaveBeenCalled();
   });
 });

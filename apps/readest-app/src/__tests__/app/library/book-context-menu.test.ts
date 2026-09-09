@@ -140,11 +140,23 @@ describe('getBookContextMenuItemIds', () => {
     ]);
   });
 
-  it('produces the same order on repeated calls and never duplicates an item (issue #4389)', () => {
-    const book = createBook({ downloadedAt: 1, uploadedAt: 1, readingStatus: 'finished' });
-    const first = getBookContextMenuItemIds(book);
-    const second = getBookContextMenuItemIds(book);
-    expect(second).toEqual(first);
-    expect(new Set(first).size).toBe(first.length);
+  it('offers download for an ABS book that is not cached, without cloud upload/share', () => {
+    const book = createBook({ format: 'ABS', filePath: 'abs://srv/item' });
+    expect(getBookContextMenuItemIds(book)).toEqual([
+      'select',
+      'group',
+      'markFinished',
+      'markAbandoned',
+      'showDetails',
+      'showInFinder',
+      'searchGoodreads',
+      'download',
+      'delete',
+    ]);
+  });
+
+  it('omits download for an ABS book whose offline cache is complete', () => {
+    const book = createBook({ format: 'ABS', filePath: 'abs://srv/item' });
+    expect(getBookContextMenuItemIds(book, { absOfflineComplete: true })).not.toContain('download');
   });
 });

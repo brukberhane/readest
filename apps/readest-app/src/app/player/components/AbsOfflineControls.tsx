@@ -1,3 +1,4 @@
+import clsx from 'clsx';
 import { useState } from 'react';
 import type { AppService } from '@/types/system';
 import type { Book } from '@/types/book';
@@ -5,6 +6,8 @@ import { absMediaDownloadManager } from '@/services/audiobookshelf/absMediaDownl
 import { absMediaJobId, useAbsMediaStore } from '@/store/absMediaStore';
 import { useTranslation } from '@/hooks/useTranslation';
 import { formatBytes } from '@/utils/book';
+import { absJobProgressPercent } from '@/utils/absMediaProgress';
+import { INDETERMINATE_PROGRESS } from '@/utils/transfer';
 import { loadAbsEpisodes } from '@/services/audiobook/openAudiobook';
 import Dialog from '@/components/Dialog';
 
@@ -46,6 +49,13 @@ const AbsOfflineControls = ({
       absMediaDownloadManager.cancel(jobId);
       return;
     }
+    if (job?.status === 'failed') {
+      void (async () => {
+        const svc = await resolveService();
+        await absMediaDownloadManager.retry(jobId, svc);
+      })();
+      return;
+    }
     if (presence?.complete) return;
     setConfirm('download');
   };
@@ -65,8 +75,8 @@ const AbsOfflineControls = ({
     });
   };
 
-  const percent =
-    job && job.totalBytes > 0 ? Math.round((job.doneBytes / job.totalBytes) * 100) : null;
+  const percent = job ? absJobProgressPercent(job) : INDETERMINATE_PROGRESS;
+  const knownPercent = percent >= 0 ? percent : null;
   const busy = job?.status === 'in_progress' || job?.status === 'pending';
   const complete = !!presence?.complete;
   const sizeLabel = formatBytes(job?.totalBytes || presence?.bytes || 0);
@@ -79,12 +89,16 @@ const AbsOfflineControls = ({
       : _('Download this audiobook for offline playback?');
 
   const primaryLabel = busy
-    ? percent != null
-      ? _('Downloading {{percent}}%', { percent })
-      : _('Downloading')
-    : complete
-      ? _('Downloaded')
-      : _('Download');
+    ? knownPercent != null
+      ? _('Downloading {{percent}}%', { percent: knownPercent })
+      : job && job.doneBytes > 0
+        ? _('Downloading {{size}}', { size: formatBytes(job.doneBytes) })
+        : _('Downloading')
+    : job?.status === 'failed'
+      ? _('Retry')
+      : complete
+        ? _('Downloaded')
+        : _('Download');
 
   return (
     <>
@@ -93,9 +107,20 @@ const AbsOfflineControls = ({
           type='button'
           aria-label={primaryLabel}
           onClick={handlePrimary}
-          className='not-eink:bg-base-200 eink-bordered flex h-14 min-w-0 w-full flex-col items-center justify-center gap-0.5 rounded-xl'
+          className='not-eink:bg-base-200 eink-bordered relative flex h-14 min-w-0 w-full flex-col items-center justify-center gap-0.5 overflow-hidden rounded-xl'
         >
           <span className='text-sm font-semibold'>{primaryLabel}</span>
+          {busy && (
+            <span className='bg-base-300 absolute inset-x-3 bottom-1.5 h-1 overflow-hidden rounded-full'>
+              <span
+                className={clsx(
+                  'bg-base-content/70 block h-full',
+                  knownPercent == null && 'w-1/3 motion-safe:animate-pulse',
+                )}
+                style={knownPercent != null ? { width: `${knownPercent}%` } : undefined}
+              />
+            </span>
+          )}
         </button>
         {complete && (
           <button

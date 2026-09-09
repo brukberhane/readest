@@ -4,6 +4,13 @@ import { useTranslation } from './useTranslation';
 import { useLibraryStore } from '@/store/libraryStore';
 import { useTransferStore, TransferType, isFailedLikeTransfer } from '@/store/transferStore';
 import { transferManager } from '@/services/transferManager';
+import { absMediaDownloadManager } from '@/services/audiobookshelf/absMediaDownload';
+import { useAbsMediaStore } from '@/store/absMediaStore';
+import {
+  absJobToTransferItem,
+  absMediaJobIdFromTransferId,
+  isAbsMediaTransferId,
+} from '@/utils/absMediaProgress';
 import { Book } from '@/types/book';
 
 // The `libraryLoaded = true` default lets surfaces like SettingsMenu and
@@ -16,6 +23,7 @@ export function useTransferQueue(libraryLoaded = true, delayInit = 0) {
   const _ = useTranslation();
 
   const transfers = useTransferStore((state) => state.transfers);
+  const absItems = useAbsMediaStore((state) => state.items);
   const isQueuePaused = useTransferStore((state) => state.isQueuePaused);
   const setIsTransferQueueOpen = useTransferStore((state) => state.setIsTransferQueueOpen);
 
@@ -28,6 +36,7 @@ export function useTransferQueue(libraryLoaded = true, delayInit = 0) {
         };
         const translationFn = _;
         await transferManager.initialize(appService, getLibrary, updateBookFn, translationFn);
+        absMediaDownloadManager.hydrate(appService);
       }
     };
 
@@ -52,16 +61,31 @@ export function useTransferQueue(libraryLoaded = true, delayInit = 0) {
   }, []);
 
   const cancelTransfer = useCallback((transferId: string) => {
+    if (isAbsMediaTransferId(transferId)) {
+      absMediaDownloadManager.cancel(absMediaJobIdFromTransferId(transferId));
+      return;
+    }
     transferManager.cancelTransfer(transferId);
   }, []);
 
-  const retryTransfer = useCallback((transferId: string) => {
-    transferManager.retryTransfer(transferId);
-  }, []);
+  const retryTransfer = useCallback(
+    (transferId: string) => {
+      if (isAbsMediaTransferId(transferId)) {
+        void absMediaDownloadManager.retry(
+          absMediaJobIdFromTransferId(transferId),
+          appService ?? undefined,
+        );
+        return;
+      }
+      transferManager.retryTransfer(transferId);
+    },
+    [appService],
+  );
 
   const retryAllFailed = useCallback(() => {
     transferManager.retryAllFailed();
-  }, []);
+    void absMediaDownloadManager.retryAllFailed(appService ?? undefined);
+  }, [appService]);
 
   const pauseQueue = useCallback(() => {
     transferManager.pauseQueue();
@@ -77,53 +101,61 @@ export function useTransferQueue(libraryLoaded = true, delayInit = 0) {
 
   const clearFailed = useCallback(() => {
     transferManager.clearFailed();
+    absMediaDownloadManager.clearFailed();
   }, []);
 
   const clearPending = useCallback(() => {
     transferManager.clearPending();
+    absMediaDownloadManager.clearPending();
   }, []);
 
   const clearAll = useCallback(() => {
     transferManager.clearAll();
+    absMediaDownloadManager.clearPending();
+    absMediaDownloadManager.clearFailed();
   }, []);
 
   const getTransferProgress = useCallback((bookHash: string, type: TransferType) => {
     return useTransferStore.getState().getTransferByBookHash(bookHash, type);
   }, []);
 
+  const allTransfers = useMemo(
+    () => [...Object.values(transfers), ...Object.values(absItems).map(absJobToTransferItem)],
+    [transfers, absItems],
+  );
+
   const stats = useMemo(() => {
-    const transferList = Object.values(transfers);
     return {
-      pending: transferList.filter((t) => t.status === 'pending').length,
-      active: transferList.filter((t) => t.status === 'in_progress').length,
-      completed: transferList.filter((t) => t.status === 'completed').length,
-      failed: transferList.filter(isFailedLikeTransfer).length,
-      total: transferList.length,
+      pending: allTransfers.filter((t) => t.status === 'pending').length,
+      active: allTransfers.filter((t) => t.status === 'in_progress').length,
+      completed: allTransfers.filter((t) => t.status === 'completed').length,
+      failed: allTransfers.filter(isFailedLikeTransfer).length,
+      total: allTransfers.length,
     };
-  }, [transfers]);
+  }, [allTransfers]);
 
   const pendingTransfers = useMemo(() => {
-    return Object.values(transfers).filter((t) => t.status === 'pending');
-  }, [transfers]);
+    return allTransfers.filter((t) => t.status === 'pending');
+  }, [allTransfers]);
 
   const activeTransfers = useMemo(() => {
-    return Object.values(transfers).filter((t) => t.status === 'in_progress');
-  }, [transfers]);
+    return allTransfers.filter((t) => t.status === 'in_progress');
+  }, [allTransfers]);
 
   const failedTransfers = useMemo(() => {
-    return Object.values(transfers).filter(isFailedLikeTransfer);
-  }, [transfers]);
+    return allTransfers.filter(isFailedLikeTransfer);
+  }, [allTransfers]);
 
   const completedTransfers = useMemo(() => {
-    return Object.values(transfers).filter((t) => t.status === 'completed');
-  }, [transfers]);
+    return allTransfers.filter((t) => t.status === 'completed');
+  }, [allTransfers]);
 
   const hasActiveTransfers = useMemo(() => {
     return pendingTransfers.length > 0 || activeTransfers.length > 0;
   }, [pendingTransfers, activeTransfers]);
 
   return {
-    transfers: Object.values(transfers),
+    transfers: allTransfers,
     isQueuePaused,
     stats,
     pendingTransfers,

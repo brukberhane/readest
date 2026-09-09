@@ -58,7 +58,9 @@ import { MIMETYPES, EXTS } from '@/libs/document';
 import { makeSafeFilename } from '@/utils/misc';
 import { isTauriAppPlatform } from '@/services/environment';
 import { isLocalSendEnabled } from '@/services/localsend/devicePrefs';
-import { splitLibraryOpenIds } from '@/utils/audiobook';
+import { useAbsMediaStore } from '@/store/absMediaStore';
+import { selectAbsDownloadProgress } from '@/utils/absMediaProgress';
+import { isAudiobook, splitLibraryOpenIds } from '@/utils/audiobook';
 
 import { useSpatialNavigation } from '../hooks/useSpatialNavigation';
 import DeleteConfirmAlert from '@/components/DeleteConfirmAlert';
@@ -784,12 +786,15 @@ const Bookshelf: React.FC<BookshelfProps> = ({
   );
 
   const selectedBooks = getSelectedBooks();
+  const absPresence = useAbsMediaStore((state) => state.presence);
 
   // Bulk download (#5244): a selected group stands in for every book it shows,
   // which is how a 300-book folder gets onto a new device in one action. Only
   // worth computing while the select-mode bar is up.
   const downloadableBooks = isSelectMode
-    ? selectDownloadableBooks(selectedBooks, sortedBookshelfItems, filteredBooks)
+    ? selectDownloadableBooks(selectedBooks, sortedBookshelfItems, filteredBooks, {
+        absPresence,
+      }).filter((book) => !isAudiobook(book) || isTauriAppPlatform())
     : [];
 
   const downloadSelectedBooks = async () => {
@@ -856,9 +861,14 @@ const Bookshelf: React.FC<BookshelfProps> = ({
   // cannot disagree about the same book. Selecting `transfers` keeps the
   // subscription off the store's unrelated UI fields.
   const transfers = useTransferStore((state) => state.transfers);
+  const absItems = useAbsMediaStore((state) => state.items);
   const transferProgress = useMemo(
-    () => ({ ...selectActiveBookDownloadProgress(transfers), ...booksTransferProgress }),
-    [transfers, booksTransferProgress],
+    () => ({
+      ...selectActiveBookDownloadProgress(transfers),
+      ...selectAbsDownloadProgress(absItems),
+      ...booksTransferProgress,
+    }),
+    [transfers, absItems, booksTransferProgress],
   );
 
   // A top-level quick-resume strip: hidden while searching, inside a group, or

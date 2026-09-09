@@ -106,7 +106,12 @@ const TransferItemRow: React.FC<{
         <div className='text-base-content/60 text-xs'>
           {transfer.status === 'in_progress' && (
             <>
-              {Math.round(transfer.progress)}% - {formatSpeed(transfer.transferSpeed)}
+              {transfer.totalBytes > 0 && transfer.progress >= 0
+                ? `${Math.round(transfer.progress)}%`
+                : transfer.transferredBytes > 0
+                  ? formatBytes(transfer.transferredBytes)
+                  : _('Downloading')}
+              {transfer.transferSpeed > 0 ? ` - ${formatSpeed(transfer.transferSpeed)}` : ''}
             </>
           )}
           {transfer.status === 'pending' && transfer.error && (
@@ -128,8 +133,17 @@ const TransferItemRow: React.FC<{
         {transfer.status === 'in_progress' && (
           <div className='bg-base-300 mt-1 h-1.5 w-full overflow-hidden rounded-full'>
             <div
-              className='bg-primary h-full transition-all'
-              style={{ width: `${transfer.progress}%` }}
+              className={clsx(
+                'bg-primary h-full',
+                transfer.totalBytes > 0 && transfer.progress >= 0
+                  ? 'transition-all'
+                  : 'w-1/3 motion-safe:animate-pulse',
+              )}
+              style={
+                transfer.totalBytes > 0 && transfer.progress >= 0
+                  ? { width: `${Math.max(0, transfer.progress)}%` }
+                  : undefined
+              }
             />
           </div>
         )}
